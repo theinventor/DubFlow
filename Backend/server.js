@@ -290,18 +290,60 @@ const downloadVideoWithYoutubeDl = async (videoId, outputPath) => {
     }
 };
 
-// Merge video and audio
-const mergeVideoAudio = async (videoPath, audioPath, outputPath) => {
-    return new Promise((resolve, reject) => {
-        ffmpeg()
-            .input(videoPath)
-            .input(audioPath)
-            .outputOptions(['-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', '-shortest'])
-            .output(outputPath)
-            .on('end', () => resolve(outputPath))
-            .on('error', reject)
-            .run();
-    });
+// Generate SRT subtitle file from translated transcript
+const generateSrtFile = async (translatedTranscript, outputPath) => {
+    const formatTime = (seconds) => {
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = Math.floor(seconds % 60);
+        const ms = Math.round((seconds % 1) * 1000);
+        return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+    };
+
+    let srt = '';
+    let index = 1;
+
+    for (const item of translatedTranscript) {
+        const text = (item.translatedText || item.text || '').trim();
+        if (!text || text.length < 2) continue;
+
+        const start = formatTime(item.start);
+        const end = formatTime(item.start + item.duration);
+        srt += `${index}\n${start} --> ${end}\n${text}\n\n`;
+        index++;
+    }
+
+    await fs.writeFile(outputPath, srt, 'utf8');
+    console.log(`📝 Generated SRT with ${index - 1} subtitle entries`);
+    return outputPath;
+};
+
+// Merge video, audio, and burned-in subtitles
+const mergeVideoAudio = async (videoPath, audioPath, outputPath, subtitlePath = null, position = 'bottom') => {
+    // Use ffmpeg CLI directly for subtitle burning — fluent-ffmpeg escaping is unreliable
+    const escapedSubPath = subtitlePath ? subtitlePath.replace(/'/g, "'\\''").replace(/:/g, '\\:') : null;
+
+    // ASS alignment: 8=top-center, 5=middle-center, 2=bottom-center
+    const alignMap = { top: 8, middle: 5, bottom: 2 };
+    const alignment = alignMap[position] || 2;
+    const marginV = position === 'middle' ? 0 : 30;
+
+    const vf = subtitlePath
+        ? `-vf "subtitles='${escapedSubPath}':force_style='Fontsize=24,PrimaryColour=&Hffffff,BackColour=&H80000000,BorderStyle=4,Outline=0,Shadow=0,Alignment=${alignment},MarginV=${marginV}'"`
+        : '-c:v copy';
+
+    const cmd = subtitlePath
+        ? `ffmpeg -y -i "${videoPath}" -i "${audioPath}" ${vf} -c:a aac -strict experimental -shortest "${outputPath}"`
+        : `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -c:v copy -c:a aac -strict experimental -shortest "${outputPath}"`;
+
+    try {
+        console.log('Running FFmpeg merge' + (subtitlePath ? ' with burned-in captions' : '') + '...');
+        await execAsync(cmd, { timeout: 600000 }); // 10 min timeout for re-encoding
+        return outputPath;
+    } catch (error) {
+        console.error('FFmpeg merge error:', error.message);
+        throw error;
+    }
 };
 
 // New endpoint to check transcript availability
@@ -348,25 +390,42 @@ const writeCache = async (filePath, data) => {
     await fs.writeFile(filePath, JSON.stringify(data));
 };
 
-// Main dubbing endpoint with OpenAI contextual translation
+// Main dubbing endpoint with SSE progress streaming
 app.post('/api/dub-video', async (req, res) => {
-    const { videoUrl, targetLanguage, contextHint, forceRefresh } = req.body;
+    const { videoUrl, targetLanguage, contextHint, forceRefresh, burnCaptions, captionPosition } = req.body;
     const jobId = uuidv4();
+
+    // Set up SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    const sendProgress = (step, label, progress = null, detail = null) => {
+        const data = { step, label, progress, detail };
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    const sendDone = (result) => {
+        res.write(`data: ${JSON.stringify({ done: true, ...result })}\n\n`);
+        res.end();
+    };
+
+    const sendError = (error) => {
+        res.write(`data: ${JSON.stringify({ error: error.message || error })}\n\n`);
+        res.end();
+    };
 
     try {
         await ensureDownloadsDir();
-
-        console.log('🎬 Starting dubbing process...');
-
-        // Step 1: Extract video ID
         const videoId = extractVideoId(videoUrl);
-        if (!videoId) {
-            return res.status(400).json({ error: 'Invalid YouTube URL' });
-        }
+        if (!videoId) { sendError({ message: 'Invalid YouTube URL' }); return; }
 
+        // Send videoId so frontend can update URL for recovery
+        res.write(`data: ${JSON.stringify({ videoId })}\n\n`);
         console.log('📹 Video ID extracted:', videoId);
 
-        // Set up cache directory
+        // Set up cache
         const cacheDir = getCacheDir(videoId, targetLanguage);
         await fs.mkdir(cacheDir, { recursive: true });
         const transcriptCache = path.join(cacheDir, 'transcript.json');
@@ -374,170 +433,165 @@ app.post('/api/dub-video', async (req, res) => {
         const contextCache = path.join(cacheDir, 'context.json');
         const cachedFinalVideo = path.join(cacheDir, 'dubbed_video.mp4');
 
-        // Check if we already have a completed video
+        // Check cache
         if (!forceRefresh) {
             try {
                 await fs.access(cachedFinalVideo);
-                console.log('✅ Found cached dubbed video, returning immediately');
-                // Copy to job dir for download
+                console.log('✅ Found cached dubbed video');
+                res.write(`data: ${JSON.stringify({ videoId })}\n\n`);
                 const jobDir = path.join(__dirname, 'downloads', jobId);
                 await fs.mkdir(jobDir, { recursive: true });
                 await fs.copyFile(cachedFinalVideo, path.join(jobDir, 'dubbed_video.mp4'));
                 const context = await readCache(contextCache);
-                return res.json({
-                    success: true,
-                    jobId,
+                sendDone({
+                    success: true, jobId,
                     downloadUrl: `/downloads/${jobId}/dubbed_video.mp4`,
                     message: 'Video returned from cache! Use "Force Refresh" to re-generate.',
-                    transcriptSegments: 0,
-                    translationErrors: 0,
-                    detectedContext: context || {},
-                    cached: true
+                    transcriptSegments: 0, translationErrors: 0,
+                    detectedContext: context || {}, cached: true
                 });
-            } catch {
-                // No cached video, proceed normally
-            }
+                return;
+            } catch { /* no cache */ }
         } else {
-            console.log('🔄 Force refresh requested, ignoring cache');
+            console.log('🔄 Force refresh requested');
         }
 
-        // Step 2: Fetch transcript (cache it)
-        console.log('📝 Fetching transcript...');
+        // Step 1: Fetch transcript
+        sendProgress('transcript', 'Fetching transcript...');
         let transcript;
 
         if (!forceRefresh) {
             transcript = await readCache(transcriptCache);
-            if (transcript) console.log(`✅ Using cached transcript (${transcript.length} segments)`);
+            if (transcript) sendProgress('transcript', 'Using cached transcript', 100);
         }
 
         if (!transcript) {
-            try {
-                transcript = await fetchTranscript(videoId);
-                await writeCache(transcriptCache, transcript);
-            } catch (transcriptError) {
-                console.error('❌ Transcript fetching failed:', transcriptError.message);
-                return res.status(400).json({
-                    error: 'Transcript fetching failed',
-                    details: transcriptError.message,
-                    suggestions: [
-                        'Try a different video with manual captions',
-                        'Check if the video has auto-generated captions enabled',
-                        'Ensure the video is publicly accessible',
-                        'Try again in a few minutes - YouTube may be rate limiting'
-                    ]
-                });
-            }
+            transcript = await fetchTranscript(videoId);
+            await writeCache(transcriptCache, transcript);
         }
 
         if (!transcript || transcript.length === 0) {
-            return res.status(400).json({
-                error: 'Empty transcript',
-                details: 'The transcript was fetched but contains no content',
-                suggestions: ['Try a different video with spoken content and captions']
-            });
+            sendError({ message: 'No transcript found for this video' });
+            return;
         }
 
+        sendProgress('transcript', `Fetched ${transcript.length} segments`, 100);
         console.log(`✅ ${transcript.length} transcript segments`);
-        if (transcript.length > 0) {
-            console.log('Transcript preview:', transcript.slice(0, 3).map(t => t.text).join(' '));
-        }
 
-        // Step 3: Detect video context (cache it)
-        console.log('🧠 Analyzing video content...');
+        // Step 2: Detect context
+        sendProgress('context', 'Analyzing video content...');
         let videoContext;
 
         if (!forceRefresh) {
             videoContext = await readCache(contextCache);
-            if (videoContext) console.log(`✅ Using cached context: "${videoContext.topic}"`);
         }
 
         if (!videoContext) {
             try {
                 videoContext = await detectTranscriptContext(transcript, contextHint);
                 await writeCache(contextCache, videoContext);
-                console.log(`✅ Detected: "${videoContext.topic}" (${videoContext.domain})`);
             } catch (contextError) {
-                console.warn('⚠️ Context detection failed:', contextError.message);
                 videoContext = { topic: 'general', domain: 'general', keyTerms: [], tone: 'neutral' };
             }
         }
 
-        // Step 4: Translate transcript (cache it)
+        sendProgress('context', `Detected: ${videoContext.topic}`, 100);
+        console.log(`✅ Context: "${videoContext.topic}"`);
+
+        // Step 3: Translate
         let translatedTranscript;
         let translationErrors = 0;
 
         if (!forceRefresh) {
             translatedTranscript = await readCache(translationCache);
-            if (translatedTranscript) console.log(`✅ Using cached translation (${translatedTranscript.length} segments)`);
+            if (translatedTranscript) sendProgress('translate', 'Using cached translation', 100);
         }
 
         if (!translatedTranscript) {
-            console.log(`🌐 Translating transcript to ${targetLanguage} with OpenAI...`);
-            try {
-                translatedTranscript = await batchTranslateWithOpenAI(transcript, targetLanguage, videoContext);
-                await writeCache(translationCache, translatedTranscript);
+            const totalBatches = Math.ceil(transcript.length / 50);
+            sendProgress('translate', `Translating to ${targetLanguage}...`, 0, `0/${totalBatches} batches`);
 
-                translationErrors = translatedTranscript.filter(item =>
-                    item.text === item.translatedText && item.text.trim().length >= 2
-                ).length;
-                console.log(`✅ Translation completed. ${translationErrors} items unchanged.`);
-            } catch (translateError) {
-                console.error('❌ Translation failed:', translateError.message);
-                translatedTranscript = transcript.map(item => ({
-                    ...item,
-                    translatedText: item.text
-                }));
-                translationErrors = transcript.length;
+            // Wrap batchTranslateWithOpenAI to get per-batch progress
+            // We'll do it inline here to stream progress
+            if (!openaiClient) throw new Error('OpenAI not initialized');
+            translatedTranscript = [];
+            const batchSize = 50;
+
+            for (let i = 0; i < transcript.length; i += batchSize) {
+                const batch = transcript.slice(i, i + batchSize);
+                const batchNum = Math.floor(i / batchSize) + 1;
+                const pct = Math.round((batchNum / totalBatches) * 100);
+                sendProgress('translate', `Translating...`, pct, `Batch ${batchNum}/${totalBatches}`);
+
+                const numberedLines = batch.map((item, idx) => `[${i + idx}] ${item.text}`).join('\n');
+
+                const systemPrompt = `You are a professional translator for ${videoContext.domain || 'general'} content.\n\nVideo context:\n- Topic: ${videoContext.topic || 'general'}\n- Key terms: ${(videoContext.keyTerms || []).join(', ')}\n- Tone: ${videoContext.tone || 'neutral'}\n\nRules:\n- Translate each numbered line to ${targetLanguage}.\n- Preserve the numbering format exactly: [N] translated text\n- Use domain-appropriate terminology for ${targetLanguage}.\n- Keep proper nouns as-is unless they have well-known translations.\n- Do not add, remove, or merge lines. One output line per input line.\n- If a line is a filler word or sound effect, translate naturally or keep as-is.`;
+
+                const response = await openaiClient.chat.completions.create({
+                    model: 'gpt-4o-mini',
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: numberedLines }
+                    ],
+                    temperature: 0.3
+                });
+
+                const outputText = response.choices[0].message.content;
+                const translatedMap = {};
+                const lineRegex = /\[(\d+)\]\s*(.+)/g;
+                let match;
+                while ((match = lineRegex.exec(outputText)) !== null) {
+                    translatedMap[parseInt(match[1])] = match[2].trim();
+                }
+
+                for (let j = 0; j < batch.length; j++) {
+                    const globalIndex = i + j;
+                    const translatedText = translatedMap[globalIndex] || batch[j].text;
+                    translatedTranscript.push({ ...batch[j], translatedText });
+                }
+
+                console.log(`🌐 Translated batch ${batchNum}/${totalBatches}`);
             }
+
+            await writeCache(translationCache, translatedTranscript);
+            translationErrors = translatedTranscript.filter(item =>
+                item.text === item.translatedText && item.text.trim().length >= 2
+            ).length;
         }
 
-        if (translationErrors > 0) {
-            console.warn(`⚠️ ${translationErrors} translation issues occurred. Some text may be in original language.`);
-        }
+        sendProgress('translate', 'Translation complete', 100);
 
-        // Step 5: Generate audio clips
-        console.log('🔊 Generating audio clips...');
+        // Step 4: Generate audio
         const audioClips = [];
         const tempDir = path.join(__dirname, 'downloads', jobId);
         await fs.mkdir(tempDir, { recursive: true });
 
-        // Generate TTS audio with concurrency for speed
         const CONCURRENCY = 8;
         let successfulClips = 0;
         const totalSegments = translatedTranscript.length;
 
+        sendProgress('audio', 'Generating audio...', 0, `0/${totalSegments}`);
+
         const generateOne = async (i) => {
             const item = translatedTranscript[i];
-
-            if (!item.translatedText || item.translatedText.trim().length < 2) {
-                return null;
-            }
+            if (!item.translatedText || item.translatedText.trim().length < 2) return null;
 
             const audioPath = path.join(tempDir, `line_${i}.mp3`);
-
             try {
                 await generateAudio(item.translatedText, targetLanguage, audioPath);
                 successfulClips++;
-                if (successfulClips % 20 === 0 || successfulClips === totalSegments) {
-                    console.log(`Generated audio ${successfulClips}/${totalSegments}`);
-                }
                 return { path: audioPath, start: item.start, duration: item.duration, index: i };
             } catch (audioError) {
-                console.error(`Error generating audio for line ${i}:`, audioError.message);
                 try {
                     const silenceDuration = Math.max(item.duration, 0.5);
                     const silencePath = path.join(tempDir, `silence_${i}.wav`);
                     await createSilence(silenceDuration, silencePath);
                     successfulClips++;
                     return { path: silencePath, start: item.start, duration: silenceDuration, index: i };
-                } catch (silenceError) {
-                    console.error(`Failed to create silence for line ${i}:`, silenceError.message);
-                    return null;
-                }
+                } catch { return null; }
             }
         };
 
-        // Process in chunks of CONCURRENCY
         for (let i = 0; i < totalSegments; i += CONCURRENCY) {
             const chunk = [];
             for (let j = i; j < Math.min(i + CONCURRENCY, totalSegments); j++) {
@@ -547,110 +601,83 @@ app.post('/api/dub-video', async (req, res) => {
             for (const result of results) {
                 if (result) audioClips.push(result);
             }
+            const pct = Math.round((Math.min(i + CONCURRENCY, totalSegments) / totalSegments) * 100);
+            sendProgress('audio', 'Generating audio...', pct, `${successfulClips}/${totalSegments}`);
         }
-        
-        if (audioClips.length === 0) {
-            throw new Error('No audio clips were generated successfully. Please check the transcript and try again.');
-        }
-        
-        console.log(`Successfully generated ${audioClips.length} audio clips`);
-        
-        // Step 5: Create aligned audio track
-        console.log('⏰ Aligning audio with timestamps...');
+
+        if (audioClips.length === 0) throw new Error('No audio clips generated');
+
+        sendProgress('audio', `Generated ${audioClips.length} audio clips`, 100);
+
+        // Step 5: Align + concatenate
+        sendProgress('merge', 'Aligning and concatenating audio...');
         const alignedAudioFiles = [];
-        
-        // Sort clips by start time
         audioClips.sort((a, b) => a.start - b.start);
-        
         let currentTime = 0;
-        
+
         for (let i = 0; i < audioClips.length; i++) {
             const clip = audioClips[i];
-            
-            // Add silence if there's a gap
             if (clip.start > currentTime) {
                 const silenceDuration = clip.start - currentTime;
-                if (silenceDuration > 0.1) { // Only add silence if gap is meaningful
+                if (silenceDuration > 0.1) {
                     const silencePath = path.join(tempDir, `gap_${i}_${Date.now()}.wav`);
                     try {
                         await createSilence(silenceDuration, silencePath);
                         alignedAudioFiles.push(silencePath);
-                    } catch (silenceError) {
-                        console.error(`Failed to create gap silence:`, silenceError.message);
-                    }
+                    } catch {}
                 }
             }
-            
             alignedAudioFiles.push(clip.path);
             currentTime = clip.start + clip.duration;
         }
-        
-        if (alignedAudioFiles.length === 0) {
-            throw new Error('No aligned audio files were created. Audio generation failed.');
-        }
-        
-        // Step 6: Concatenate all audio
-        console.log('🔗 Concatenating audio clips...');
+
         const finalAudioPath = path.join(tempDir, 'final_audio.wav');
-        
         try {
             await concatenateAudio(alignedAudioFiles, finalAudioPath);
-        } catch (concatError) {
-            console.error('Concatenation failed, trying alternative method:', concatError.message);
-            
-            // Alternative: Create a single silence file if concatenation fails
-            const totalDuration = Math.max(
-                ...audioClips.map(clip => clip.start + clip.duration)
-            );
+        } catch {
+            const totalDuration = Math.max(...audioClips.map(clip => clip.start + clip.duration));
             await createSilence(totalDuration || 10, finalAudioPath);
         }
-        
-        // Step 7: Download video
-        console.log('📥 Downloading video...');
+
+        // Step 6: Download video
+        sendProgress('merge', 'Downloading video...');
         const videoPath = path.join(tempDir, 'video.mp4');
-        
         try {
             await downloadVideoOnly(videoId, videoPath);
         } catch (error) {
-            console.error('yt-dlp failed, trying youtube-dl:', error.message);
-            try {
-                await downloadVideoWithYoutubeDl(videoId, videoPath);
-            } catch (fallbackError) {
-                throw new Error(`Both yt-dlp and youtube-dl failed. Please ensure one of them is installed: ${error.message}`);
-            }
+            try { await downloadVideoWithYoutubeDl(videoId, videoPath); }
+            catch (fb) { throw new Error(`Video download failed: ${error.message}`); }
         }
-        
-        // Step 8: Merge video and audio
-        console.log('🎭 Merging video and audio...');
-        const finalVideoPath = path.join(tempDir, 'dubbed_video.mp4');
-        await mergeVideoAudio(videoPath, finalAudioPath, finalVideoPath);
-        
-        console.log('✅ Dubbing completed successfully!');
 
-        // Cache the final video
+        // Step 7: Subtitles + merge
+        let subtitlePath = null;
+        if (burnCaptions) {
+            sendProgress('merge', 'Generating subtitles...');
+            subtitlePath = path.join(tempDir, 'subtitles.srt');
+            await generateSrtFile(translatedTranscript, subtitlePath);
+        }
+
+        sendProgress('merge', burnCaptions ? 'Merging video, audio, and captions...' : 'Merging video and audio...');
+        const finalVideoPath = path.join(tempDir, 'dubbed_video.mp4');
+        await mergeVideoAudio(videoPath, finalAudioPath, finalVideoPath, subtitlePath, captionPosition);
+
+        // Cache
         try {
             await fs.copyFile(finalVideoPath, cachedFinalVideo);
-            console.log('💾 Cached dubbed video for future requests');
-        } catch (cacheErr) {
-            console.warn('⚠️ Failed to cache video:', cacheErr.message);
-        }
+        } catch {}
 
-        res.json({
-            success: true,
-            jobId,
+        console.log('✅ Dubbing completed successfully!');
+        sendDone({
+            success: true, jobId,
             downloadUrl: `/downloads/${jobId}/dubbed_video.mp4`,
             message: 'Video dubbed successfully with AI-powered contextual translation!',
             transcriptSegments: transcript.length,
-            translationErrors: translationErrors,
-            detectedContext: videoContext
+            translationErrors, detectedContext: videoContext
         });
-        
+
     } catch (error) {
         console.error('❌ Error during dubbing process:', error);
-        res.status(500).json({
-            error: 'Failed to dub video',
-            details: error.message
-        });
+        sendError(error);
     }
 });
 
@@ -670,6 +697,37 @@ app.get('/api/job-status/:jobId', async (req, res) => {
         res.json({
             status: 'processing'
         });
+    }
+});
+
+// Check cache status by videoId + language (for recovery after page refresh)
+app.get('/api/cache-status/:videoId/:language', async (req, res) => {
+    const { videoId, language } = req.params;
+    const cacheDir = getCacheDir(videoId, language);
+    const cachedVideo = path.join(cacheDir, 'dubbed_video.mp4');
+    const contextCache = path.join(cacheDir, 'context.json');
+
+    try {
+        await fs.access(cachedVideo);
+        // Video exists — copy to a job dir for serving
+        const jobId = uuidv4();
+        const jobDir = path.join(__dirname, 'downloads', jobId);
+        await fs.mkdir(jobDir, { recursive: true });
+        await fs.copyFile(cachedVideo, path.join(jobDir, 'dubbed_video.mp4'));
+        const context = await readCache(contextCache);
+        res.json({
+            status: 'completed',
+            success: true,
+            jobId,
+            downloadUrl: `/downloads/${jobId}/dubbed_video.mp4`,
+            message: 'Video recovered from cache!',
+            transcriptSegments: 0,
+            translationErrors: 0,
+            detectedContext: context || {},
+            cached: true
+        });
+    } catch {
+        res.json({ status: 'processing' });
     }
 });
 

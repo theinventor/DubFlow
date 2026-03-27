@@ -1,277 +1,205 @@
-# 🎙️ DubFlow - AI-Powered YouTube Video Dubbing
+# DubFlow - AI-Powered YouTube Video Dubbing
 
-Transform any YouTube video into multiple languages with AI-powered dubbing technology. DubFlow automatically extracts transcripts, translates content, generates natural-sounding speech, and creates professionally dubbed videos.
+Transform any YouTube video into multiple languages with AI-powered dubbing. DubFlow extracts transcripts, detects video context, translates with domain-aware terminology, generates natural speech, and produces dubbed videos with optional burned-in captions.
 
-![DubFlow Demo](https://img.shields.io/badge/Status-Active-brightgreen) ![Node.js](https://img.shields.io/badge/Node.js-v18+-blue) ![Next.js](https://img.shields.io/badge/Next.js-v13+-black) 
-### 🏠 Home Page
-![HomePage](images/Screenshot%202025-06-08%20162120.png)
+## Features
 
-### 🎬 Dubbing a YouTube Video
-![Dubbing a YouTube video](images/Screenshot%202025-06-08%20162211.png)
+- **Context-Aware Translation**: OpenAI analyzes the transcript to detect the video's domain (e.g., "Snowmobile Track Replacement" / "Automotive Repair") and uses appropriate terminology when translating
+- **Optional Context Hints**: Tell the AI what the video is about for even better translations
+- **OpenAI TTS**: Natural-sounding text-to-speech via OpenAI's `tts-1` model
+- **Burned-In Captions**: Optionally burn translated captions into the video with configurable position (top/middle/bottom)
+- **Smart Caching**: Transcript, translation, context, and final video are cached per video+language combo. Re-dubbing the same video is instant.
+- **Auto-Caption Support**: Uses yt-dlp to reliably fetch auto-generated YouTube captions (not just manual subtitles)
+- **Real-Time Progress**: SSE-based progress streaming with step-aware progress bars for translation batches and audio generation
+- **Page Recovery**: Video ID and language are stored in the URL. If you refresh mid-process, the page polls for the completed video and recovers automatically.
+- **Concurrent TTS**: 8 parallel audio generation requests for faster processing
+- **16+ Languages**: Spanish, French, German, Italian, Portuguese, Russian, Japanese, Korean, Chinese, Hindi, Arabic, Dutch, Polish, Turkish, Thai, Vietnamese
 
-### 🌐 Language Selection
-![Language Selection](images/Screenshot%202025-06-08%20162227.png)
+## Tech Stack
 
-### ⚙️ Processing
-![Processing](images/Screenshot%202025-06-08%20162256.png)
+| Component | Technology |
+|-----------|-----------|
+| **Frontend** | Next.js 14, React 18, Tailwind CSS |
+| **Backend** | Node.js, Express.js |
+| **Translation** | OpenAI gpt-4o-mini (context-aware, batched) |
+| **Text-to-Speech** | OpenAI tts-1 |
+| **Transcript** | yt-dlp (primary), youtube-transcript (fallback) |
+| **Video Processing** | FFmpeg, yt-dlp |
 
-### 📺 Dubbed Video Display
-![Dubbed Video display](images/Screenshot%202025-06-08%20162539.png)
+## Prerequisites
 
+- Node.js v18+
+- FFmpeg
+- yt-dlp
+- OpenAI API key
 
+### Install system dependencies
 
-## ✨ Features
+**macOS:**
+```bash
+brew install ffmpeg yt-dlp
+```
 
-- 🎬 **YouTube Video Processing**: Seamlessly download and process YouTube videos
-- 📝 **Smart Transcript Extraction**: Advanced transcript fetching with multiple fallback strategies
-- 🌍 **Multi-Language Translation**: Support for 16+ languages using RapidAPI Google Translator
-- 🔊 **Natural Speech Generation**: High-quality text-to-speech using Google TTS
-- ⏰ **Precise Audio Alignment**: Maintains original timing and synchronization
-- 🎭 **Professional Video Merging**: Combines dubbed audio with original video
-- 📊 **Real-time Progress Tracking**: Live updates during processing
-- 🚀 **Modern UI/UX**: Beautiful gradient interface with animations
+**Ubuntu/Debian:**
+```bash
+sudo apt update && sudo apt install ffmpeg yt-dlp
+```
 
-## 🎯 Supported Languages
-
-- Spanish (Español)
-- French (Français)
-- German (Deutsch)
-- Italian (Italiano)
-- Portuguese (Português)
-- Russian (Русский)
-- Japanese (日本語)
-- Korean (한국어)
-- Chinese (中文)
-- Hindi (हिंदी)
-- Arabic (العربية)
-- Dutch (Nederlands)
-- Polish (Polski)
-- Turkish (Türkçe)
-- Thai (ไทย)
-- Vietnamese (Tiếng Việt)
-
-## 🏗️ Architecture
-
-### Backend (Node.js/Express)
-- **Transcript Extraction**: Enhanced retry logic with multiple fallback methods
-- **Translation Service**: RapidAPI Google Translator integration
-- **Audio Processing**: FFmpeg for audio manipulation and merging
-- **Video Processing**: yt-dlp/youtube-dl for reliable video downloads
-- **Text-to-Speech**: Google TTS (gTTS) for natural voice generation
-
-### Frontend (Next.js/React)
-- **Modern UI**: Tailwind CSS with gradient animations
-- **Real-time Updates**: Live progress tracking and status updates
-- **Responsive Design**: Mobile-first approach with beautiful animations
-- **Error Handling**: Comprehensive error messages and user guidance
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Node.js v18 or higher
-- npm or yarn
-- FFmpeg installed on your system
-- yt-dlp or youtube-dl installed
-- RapidAPI account with Google Translator access
-
-### Installation
+## Setup
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/dubflow.git
-   cd dubflow
+   git clone https://github.com/theinventor/DubFlow.git
+   cd DubFlow
    ```
 
-2. **Install backend dependencies**
+2. **Install dependencies**
    ```bash
-   cd backend
-   npm install
+   cd Backend && npm install
+   cd ../Frontend && npm install
    ```
 
-3. **Install frontend dependencies**
-   ```bash
-   cd ../frontend
-   npm install
-   ```
+3. **Configure environment variables**
 
-4. **Set up environment variables**
-   
-   Create a `.env` file in the backend directory:
+   Create `Backend/.env`:
    ```env
+   OPENAI_API_KEY=sk-your-openai-key-here
    PORT=3001
-   RAPIDAPI_KEY=your_rapidapi_key_here
    ```
 
-5. **Install system dependencies**
-   
-   **On macOS:**
+4. **Run the app**
+
+   Terminal 1 (backend):
    ```bash
-   brew install ffmpeg yt-dlp
+   cd Backend && node server.js
    ```
-   
-   **On Ubuntu/Debian:**
+
+   Terminal 2 (frontend):
    ```bash
-   sudo apt update
-   sudo apt install ffmpeg yt-dlp
+   cd Frontend && npm run dev
    ```
-   
-   **On Windows:**
-   - Download FFmpeg from https://ffmpeg.org/download.html
-   - Download yt-dlp from https://github.com/yt-dlp/yt-dlp
 
-### Running the Application
+5. Open http://localhost:3000
 
-1. **Start the backend server**
-   ```bash
-   cd backend
-   npm start
-   ```
-   The backend will run on http://localhost:3001
+## How It Works
 
-2. **Start the frontend development server**
-   ```bash
-   cd frontend
-   npm run dev
-   ```
-   The frontend will run on http://localhost:3000
+```
+YouTube URL + Language + Optional Context Hint
+    |
+    v
+Extract Video ID
+    |
+    v
+Fetch Transcript (yt-dlp auto-captions, with npm fallback)
+    |
+    v
+Detect Video Context (OpenAI gpt-4o-mini → domain, key terms, tone)
+    |
+    v
+Translate in Batches of 50 (OpenAI gpt-4o-mini, context-aware prompts)
+    |
+    v
+Generate TTS Audio (OpenAI tts-1, 8 concurrent requests)
+    |
+    v
+Align Audio with Original Timestamps + Silence Gaps
+    |
+    v
+Download Original Video (yt-dlp)
+    |
+    v
+[Optional] Generate SRT + Burn Captions (FFmpeg subtitles filter)
+    |
+    v
+Merge Video + Audio (FFmpeg)
+    |
+    v
+Cache Result + Serve
+```
 
-3. **Open your browser** and navigate to http://localhost:3000
-
-## 📚 API Documentation
+## API Endpoints
 
 ### POST /api/dub-video
-Processes a YouTube video for dubbing.
+
+Dubs a YouTube video. Returns an SSE stream with progress events, then a final result.
 
 **Request Body:**
 ```json
 {
   "videoUrl": "https://www.youtube.com/watch?v=VIDEO_ID",
-  "targetLanguage": "spanish"
+  "targetLanguage": "spanish",
+  "contextHint": "This is a video about fixing a snowmobile engine",
+  "forceRefresh": false,
+  "burnCaptions": true,
+  "captionPosition": "bottom"
 }
 ```
 
-**Response:**
-```json
-{
-  "success": true,
-  "jobId": "uuid-here",
-  "downloadUrl": "/downloads/uuid/dubbed_video.mp4",
-  "message": "Video dubbed successfully!",
-  "transcriptSegments": 150,
-  "translationErrors": 0
-}
+**SSE Progress Events:**
 ```
+data: {"videoId":"abc123"}
+data: {"step":"transcript","label":"Fetching transcript...","progress":null}
+data: {"step":"translate","label":"Translating...","progress":40,"detail":"Batch 2/5"}
+data: {"step":"audio","label":"Generating audio...","progress":75,"detail":"380/537"}
+data: {"done":true,"success":true,"jobId":"...","downloadUrl":"/downloads/.../dubbed_video.mp4",...}
+```
+
+### GET /api/cache-status/:videoId/:language
+
+Check if a cached dubbed video exists (used for page refresh recovery).
 
 ### POST /api/check-transcript
-Validates transcript availability before processing.
 
-**Request Body:**
-```json
-{
-  "videoUrl": "https://www.youtube.com/watch?v=VIDEO_ID"
-}
-```
+Validate transcript availability for a video.
 
 ### GET /api/job-status/:jobId
-Checks the status of a dubbing job.
 
-**Response:**
-```json
-{
-  "status": "completed",
-  "downloadUrl": "/downloads/jobId/dubbed_video.mp4"
-}
-```
+Check status of a dubbing job by job ID.
 
 ### GET /api/health
-Health check endpoint.
 
-## 🔧 Configuration
+Health check.
 
-### Environment Variables
+## Environment Variables
 
-| Variable | Description | Required | Default |
-|----------|-------------|----------|---------|
-| `PORT` | Backend server port | No | 3001 |
-| `RAPIDAPI_KEY` | RapidAPI key for Google Translator | Yes | - |
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `OPENAI_API_KEY` | OpenAI API key (used for translation + TTS) | Yes |
+| `PORT` | Backend server port | No (default: 3001) |
 
-### Customization Options
+## Cost Estimate
 
-- **Batch Size**: Adjust translation batch size in the backend code
-- **Retry Logic**: Configure retry attempts and delays for transcript fetching
-- **Audio Quality**: Modify FFmpeg settings for different audio quality
-- **Language Support**: Add new languages by updating the language maps
+Per video (e.g., 537 segments / ~30 min video):
+- **OpenAI Translation**: ~$0.01 (gpt-4o-mini, batched)
+- **OpenAI TTS**: ~$0.40 (tts-1, ~27k characters)
+- **Total**: ~$0.41 per video
+- **Cached re-dub**: $0
 
-## 🎨 Frontend Customization
+## Caching
 
-The frontend uses Tailwind CSS for styling. Key customization options:
+Results are cached in `Backend/downloads/cache/{videoId}_{language}/`:
+- `transcript.json` — raw transcript
+- `context.json` — detected video context
+- `translation.json` — translated segments
+- `dubbed_video.mp4` — final output
 
-- **Color Scheme**: Modify gradient colors in the component
-- **Animations**: Adjust animation delays and durations
-- **Layout**: Customize the responsive grid system
-- **Progress Indicators**: Modify loading states and progress displays
+Same video + same language = instant return. Different language = reuses cached transcript.
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
-### Common Issues
+**"No transcript found"** — Make sure the video has captions (auto-generated or manual). yt-dlp handles auto-captions well, but some videos have none.
 
-1. **"No transcript found" error**
-   - Ensure the video has captions enabled
-   - Try videos with manual subtitles instead of auto-generated ones
-   - Check if the video is publicly accessible
+**Translation quality** — Use the "Context Hint" field to tell the AI what the video is about. This dramatically improves domain-specific terminology.
 
-2. **Translation failures**
-   - Verify your RapidAPI key is correct and active
-   - Check your RapidAPI subscription limits
-   - Monitor API rate limiting
+**Slow processing** — The TTS step is the bottleneck (one API call per segment, 8 concurrent). A 500-segment video takes a few minutes.
 
-3. **Video download issues**
-   - Ensure yt-dlp is installed and updated
-   - Check if the video is available in your region
-   - Try different video formats or quality settings
+**yt-dlp errors** — Keep yt-dlp updated: `brew upgrade yt-dlp`
 
-4. **FFmpeg errors**
-   - Verify FFmpeg is properly installed
-   - Check system PATH configuration
-   - Ensure sufficient disk space for processing
+## Acknowledgments
 
-### Debug Mode
-
-Enable debug logging by setting:
-```env
-DEBUG=true
-```
-
-## 🤝 Contributing
-
-We welcome contributions! Please follow these steps:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Development Guidelines
-
-- Follow ESLint configuration
-- Write descriptive commit messages
-- Add tests for new features
-- Update documentation as needed
-
-## 📜 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [youtube-transcript](https://github.com/Kakulukian/youtube-transcript) for transcript extraction
-- [RapidAPI](https://rapidapi.com/) for translation services
+- [OpenAI](https://openai.com/) for translation and text-to-speech APIs
 - [FFmpeg](https://ffmpeg.org/) for video/audio processing
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for reliable YouTube downloads
-- [Google TTS](https://github.com/zlargon/google-tts) for speech synthesis
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for YouTube downloads and caption extraction
+- [youtube-transcript](https://github.com/Kakulukian/youtube-transcript) for fallback transcript extraction
 
-
-
-**Made with ❤️ for content creators worldwide**
+Originally forked from [Badri467/DubFlow](https://github.com/Badri467/DubFlow).

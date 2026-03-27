@@ -1,7 +1,15 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Play, Download, Globe, Zap, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+
+const STEPS = [
+  { key: 'transcript', label: 'Extracting transcript' },
+  { key: 'context', label: 'Analyzing context' },
+  { key: 'translate', label: 'Translating' },
+  { key: 'audio', label: 'Generating audio' },
+  { key: 'merge', label: 'Merging video' },
+];
 
 export default function YouTubeDubber() {
   const [videoUrl, setVideoUrl] = useState('');
@@ -11,6 +19,44 @@ export default function YouTubeDubber() {
   const [error, setError] = useState('');
   const [contextHint, setContextHint] = useState('');
   const [forceRefresh, setForceRefresh] = useState(false);
+  const [burnCaptions, setBurnCaptions] = useState(false);
+  const [captionPosition, setCaptionPosition] = useState('bottom');
+  const [progress, setProgress] = useState(null); // { step, label, progress, detail }
+  const [recovering, setRecovering] = useState(false);
+
+  // On mount, check URL params for in-progress or completed job
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const v = params.get('v');
+    const lang = params.get('lang');
+    if (!v || !lang) return;
+
+    setRecovering(true);
+    setIsLoading(true);
+    setProgress({ step: 'merge', label: 'Checking for completed video...', progress: null, detail: null });
+
+    let cancelled = false;
+
+    const poll = async () => {
+      while (!cancelled) {
+        try {
+          const res = await fetch(`http://localhost:3001/api/cache-status/${v}/${lang}`);
+          const data = await res.json();
+          if (data.status === 'completed') {
+            setResult(data);
+            setIsLoading(false);
+            setRecovering(false);
+            return;
+          }
+        } catch {}
+        // Wait 3 seconds before polling again
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    };
+
+    poll();
+    return () => { cancelled = true; };
+  }, []);
 
   const languages = [
     { code: 'spanish', name: 'Spanish (Español)' },
@@ -36,28 +82,64 @@ export default function YouTubeDubber() {
     setIsLoading(true);
     setError('');
     setResult(null);
+    setProgress(null);
 
     try {
       const response = await fetch('http://localhost:3001/api/dub-video', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           videoUrl,
           targetLanguage,
           contextHint: contextHint.trim() || undefined,
-          forceRefresh
+          forceRefresh,
+          burnCaptions,
+          captionPosition: burnCaptions ? captionPosition : undefined
         })
       });
 
-      const data = await response.json();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to process video');
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.error) {
+              throw new Error(data.error);
+            }
+
+            // Backend sends videoId early — update URL for recovery
+            if (data.videoId) {
+              const url = new URL(window.location);
+              url.searchParams.set('v', data.videoId);
+              url.searchParams.set('lang', targetLanguage);
+              window.history.replaceState({}, '', url);
+              continue;
+            }
+
+            if (data.done) {
+              setResult(data);
+            } else {
+              setProgress(data);
+            }
+          } catch (parseErr) {
+            if (parseErr.message && !parseErr.message.includes('JSON')) {
+              throw parseErr;
+            }
+          }
+        }
       }
-
-      setResult(data);
     } catch (err) {
       setError(err.message || 'Something went wrong. Please try again.');
     } finally {
@@ -70,9 +152,17 @@ export default function YouTubeDubber() {
     setTargetLanguage('spanish');
     setContextHint('');
     setForceRefresh(false);
+    setBurnCaptions(false);
+    setCaptionPosition('bottom');
     setResult(null);
     setError('');
+    setProgress(null);
+    setRecovering(false);
+    window.history.replaceState({}, '', window.location.pathname);
   };
+
+  // Determine which step index is active
+  const activeStepIndex = progress ? STEPS.findIndex(s => s.key === progress.step) : -1;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-violet-900 via-purple-900 to-indigo-900 relative overflow-hidden">
@@ -87,7 +177,7 @@ export default function YouTubeDubber() {
         {/* Header */}
         <div className="text-center mb-12">
           <h1 className="text-5xl md:text-7xl font-bold text-white mb-4 bg-gradient-to-r from-pink-400 via-purple-400 to-indigo-400 bg-clip-text text-transparent">
-            🎙️ YouTube Video Dubber
+            YouTube Video Dubber
           </h1>
           <p className="text-xl text-gray-300 max-w-2xl mx-auto">
             Transform any YouTube video into multiple languages with AI-powered dubbing
@@ -95,14 +185,14 @@ export default function YouTubeDubber() {
         </div>
 
         {!result ? (
-         
+
           <div className="max-w-2xl mx-auto">
             <div className="backdrop-blur-xl bg-white/10 rounded-3xl p-8 shadow-2xl border border-white/20">
               <form onSubmit={handleSubmit} className="space-y-6">
                 {/* YouTube URL Input */}
                 <div>
                   <label className="block text-white text-sm font-medium mb-3">
-                    🎬 YouTube Video URL
+                    YouTube Video URL
                   </label>
                   <div className="relative">
                     <input
@@ -120,7 +210,7 @@ export default function YouTubeDubber() {
                 {/* Language Selection */}
                 <div>
                   <label className="block text-white text-sm font-medium mb-3">
-                    🌍 Target Language
+                    Target Language
                   </label>
                   <div className="relative">
                     <select
@@ -152,16 +242,45 @@ export default function YouTubeDubber() {
                   />
                 </div>
 
-                {/* Force Refresh */}
-                <label className="flex items-center gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={forceRefresh}
-                    onChange={(e) => setForceRefresh(e.target.checked)}
-                    className="w-4 h-4 rounded border-white/20 bg-white/10 text-purple-500 focus:ring-purple-400"
-                  />
-                  <span className="text-gray-300 text-sm">Force refresh (ignore cached results)</span>
-                </label>
+                {/* Checkboxes */}
+                <div className="space-y-3">
+                  <label className="flex items-center gap-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={forceRefresh}
+                      onChange={(e) => setForceRefresh(e.target.checked)}
+                      className="w-4 h-4 rounded border-white/20 bg-white/10 text-purple-500 focus:ring-purple-400"
+                    />
+                    <span className="text-gray-300 text-sm">Force refresh (ignore cached results)</span>
+                  </label>
+                  <label className="flex items-center gap-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={burnCaptions}
+                      onChange={(e) => setBurnCaptions(e.target.checked)}
+                      className="w-4 h-4 rounded border-white/20 bg-white/10 text-purple-500 focus:ring-purple-400"
+                    />
+                    <span className="text-gray-300 text-sm">Burn captions into video</span>
+                  </label>
+                  {burnCaptions && (
+                    <div className="flex items-center gap-4 pl-7">
+                      <span className="text-gray-400 text-sm">Position:</span>
+                      {['top', 'middle', 'bottom'].map((pos) => (
+                        <label key={pos} className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="captionPosition"
+                            value={pos}
+                            checked={captionPosition === pos}
+                            onChange={(e) => setCaptionPosition(e.target.value)}
+                            className="w-3.5 h-3.5 border-white/20 bg-white/10 text-purple-500 focus:ring-purple-400"
+                          />
+                          <span className="text-gray-300 text-sm capitalize">{pos}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
 
                 {/* Error Message */}
                 {error && (
@@ -180,7 +299,7 @@ export default function YouTubeDubber() {
                   {isLoading ? (
                     <div className="flex items-center justify-center gap-3">
                       <Loader2 className="w-5 h-5 animate-spin" />
-                      <span>Processing Magic...</span>
+                      <span>Processing...</span>
                     </div>
                   ) : (
                     <div className="flex items-center justify-center gap-3">
@@ -192,39 +311,64 @@ export default function YouTubeDubber() {
               </form>
             </div>
 
-            {/* Loading Animation */}
-            {isLoading && (
+            {/* Progress Panel */}
+            {isLoading && progress && (
               <div className="mt-8 backdrop-blur-xl bg-white/10 rounded-3xl p-8 shadow-2xl border border-white/20">
-                <div className="text-center">
-                  <div className="w-16 h-16 mx-auto mb-4">
-                    <div className="w-16 h-16 border-4 border-purple-400 border-t-transparent rounded-full animate-spin"></div>
-                  </div>
-                  <h3 className="text-xl font-semibold text-white mb-2">Creating Your Dubbed Video</h3>
-                  <p className="text-gray-300 mb-4">This may take a few minutes...</p>
-                  
-                  {/* Progress Steps */}
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse"></div>
-                      <span className="text-sm">Extracting transcript</span>
-                    </div>
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-150"></div>
-                      <span className="text-sm">Analyzing video context</span>
-                    </div>
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-300"></div>
-                      <span className="text-sm">Translating with context</span>
-                    </div>
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-700"></div>
-                      <span className="text-sm">Generating audio</span>
-                    </div>
-                    <div className="flex items-center justify-center gap-3 text-purple-300">
-                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-1000"></div>
-                      <span className="text-sm">Merging video</span>
-                    </div>
-                  </div>
+                <h3 className="text-xl font-semibold text-white mb-6">Creating Your Dubbed Video</h3>
+
+                {/* Steps */}
+                <div className="space-y-4">
+                  {STEPS.map((step, idx) => {
+                    const isActive = step.key === progress.step;
+                    const isDone = idx < activeStepIndex;
+                    const isPending = idx > activeStepIndex;
+
+                    return (
+                      <div key={step.key}>
+                        <div className="flex items-center gap-3 mb-1.5">
+                          {/* Status icon */}
+                          <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 ${
+                            isDone ? 'bg-green-500' : isActive ? 'bg-purple-500' : 'bg-white/10'
+                          }`}>
+                            {isDone ? (
+                              <CheckCircle className="w-4 h-4 text-white" />
+                            ) : isActive ? (
+                              <Loader2 className="w-3.5 h-3.5 text-white animate-spin" />
+                            ) : (
+                              <div className="w-2 h-2 bg-white/30 rounded-full" />
+                            )}
+                          </div>
+
+                          {/* Label */}
+                          <span className={`text-sm flex-1 ${
+                            isDone ? 'text-green-300' : isActive ? 'text-white font-medium' : 'text-gray-500'
+                          }`}>
+                            {isActive ? progress.label : isDone ? step.label : step.label}
+                          </span>
+
+                          {/* Detail text */}
+                          {isActive && progress.detail && (
+                            <span className="text-xs text-purple-300">{progress.detail}</span>
+                          )}
+
+                          {/* Percentage */}
+                          {isActive && progress.progress !== null && (
+                            <span className="text-xs text-purple-300 w-10 text-right">{progress.progress}%</span>
+                          )}
+                        </div>
+
+                        {/* Progress bar */}
+                        {isActive && progress.progress !== null && (
+                          <div className="ml-9 h-2 bg-white/10 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-gradient-to-r from-purple-500 to-pink-500 rounded-full transition-all duration-500 ease-out"
+                              style={{ width: `${progress.progress}%` }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -285,7 +429,7 @@ export default function YouTubeDubber() {
 
               {/* Video Player */}
               <div className="mb-6">
-                <h3 className="text-xl font-semibold text-white mb-4">🎬 Your Dubbed Video</h3>
+                <h3 className="text-xl font-semibold text-white mb-4">Your Dubbed Video</h3>
                 <div className="bg-black/50 rounded-2xl overflow-hidden border border-white/10">
                   <video
                     controls
@@ -322,7 +466,7 @@ export default function YouTubeDubber() {
         {/* Footer */}
         <div className="text-center mt-12">
           <p className="text-gray-400 text-sm">
-            Powered by AI • Made with ❤️ for content creators
+            Powered by AI
           </p>
         </div>
       </div>
