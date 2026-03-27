@@ -1,10 +1,13 @@
+// Load environment variables first
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs').promises;
 const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
-const axios = require('axios'); // Added for RapidAPI requests
-const gTTS = require('gtts');
+const axios = require('axios');
+const OpenAI = require('openai');
 const { v4: uuidv4 } = require('uuid');
 const { exec } = require('child_process');
 const { promisify } = require('util');
@@ -21,20 +24,17 @@ app.use(cors());
 app.use(express.json());
 app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
 
-// Load environment variables
-require('dotenv').config();
-
-// RapidAPI Configuration
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
-const RAPIDAPI_HOST = 'google-translator9.p.rapidapi.com';
-
-// Initialize RapidAPI Translator
+// OpenAI Configuration (used for both translation and TTS)
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+let openaiClient = null;
 let translatorAvailable = false;
-if (RAPIDAPI_KEY) {
+
+if (OPENAI_API_KEY) {
+    openaiClient = new OpenAI({ apiKey: OPENAI_API_KEY });
     translatorAvailable = true;
-    console.log('✅ RapidAPI Translator initialized');
+    console.log('✅ OpenAI initialized (translation + TTS)');
 } else {
-    console.error('❌ RapidAPI key not found. Please set RAPIDAPI_KEY in your environment variables');
+    console.error('❌ OPENAI_API_KEY not found. Please set it in your environment variables');
 }
 
 // Ensure downloads directory exists
@@ -54,278 +54,140 @@ const extractVideoId = (url) => {
     return match ? match[1] : null;
 };
 
-// Language code mapping for RapidAPI Google Translator
-const getRapidApiLanguageCode = (language) => {
-    const languageMap = {
-        'spanish': 'es',
-        'french': 'fr',
-        'german': 'de',
-        'italian': 'it',
-        'portuguese': 'pt',
-        'russian': 'ru',
-        'japanese': 'ja',
-        'korean': 'ko',
-        'chinese': 'zh-CN',
-        'chinese simplified': 'zh-CN',
-        'chinese traditional': 'zh-TW',
-        'hindi': 'hi',
-        'arabic': 'ar',
-        'dutch': 'nl',
-        'polish': 'pl',
-        'turkish': 'tr',
-        'swedish': 'sv',
-        'norwegian': 'no',
-        'danish': 'da',
-        'finnish': 'fi',
-        'greek': 'el',
-        'hebrew': 'he',
-        'thai': 'th',
-        'vietnamese': 'vi',
-        'indonesian': 'id',
-        'malay': 'ms',
-        'tagalog': 'tl',
-        'urdu': 'ur',
-        'bengali': 'bn',
-        'tamil': 'ta',
-        'telugu': 'te',
-        'marathi': 'mr',
-        'gujarati': 'gu',
-        'kannada': 'kn',
-        'malayalam': 'ml',
-        'punjabi': 'pa'
-    };
-    
-    return languageMap[language.toLowerCase()] || language.toLowerCase();
+// Detect video context from transcript using OpenAI
+const detectTranscriptContext = async (transcript, userContextHint = '') => {
+    const fullText = transcript.map(s => s.text).join(' ');
+    const truncated = fullText.split(/\s+/).slice(0, 3000).join(' ');
+
+    const systemPrompt = `You are a video content analyst. Given a transcript, identify:
+1. The main topic/domain of the video
+2. Key domain-specific terms and proper nouns
+3. The tone/register (formal, casual, technical, educational)
+
+Respond in JSON:
+{"topic": "brief topic", "domain": "domain category", "keyTerms": ["term1", "term2"], "tone": "tone"}`;
+
+    const userMessage = userContextHint
+        ? `User provided context: "${userContextHint}"\n\nTranscript:\n${truncated}`
+        : `Transcript:\n${truncated}`;
+
+    const response = await openaiClient.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage }
+        ],
+        temperature: 0.3,
+        response_format: { type: 'json_object' }
+    });
+
+    return JSON.parse(response.choices[0].message.content);
 };
 
-// Translate text using RapidAPI Google Translator
-const translateText = async (text, targetLanguage) => {
-    try {
-        if (!translatorAvailable) {
-            throw new Error('RapidAPI Translator not initialized. Please check your API key.');
-        }
-
-        // Skip translation if text is too short or empty
-        if (!text || text.trim().length < 2) {
-            return text;
-        }
-
-        const targetLangCode = getRapidApiLanguageCode(targetLanguage);
-        
-        const options = {
-            method: 'POST',
-            url: 'https://google-translator9.p.rapidapi.com/v2',
-            headers: {
-                'x-rapidapi-key': RAPIDAPI_KEY,
-                'x-rapidapi-host': RAPIDAPI_HOST,
-                'Content-Type': 'application/json'
-            },
-            data: {
-                q: text.trim(),
-                source: 'auto', // Auto-detect source language
-                target: targetLangCode,
-                format: 'text'
-            }
-        };
-
-        const response = await axios.request(options);
-        
-        // Extract translated text from RapidAPI response format
-        if (response.data && response.data.data && response.data.data.translations && response.data.data.translations.length > 0) {
-            const translatedText = response.data.data.translations[0].translatedText;
-            return translatedText || text;
-        } else {
-            console.warn('Unexpected response format from RapidAPI, using original text');
-            return text;
-        }
-        
-    } catch (error) {
-        console.error('RapidAPI Translation error:', error.message);
-        
-        // More specific error handling
-        if (error.response) {
-            const status = error.response.status;
-            if (status === 401) {
-                throw new Error('Invalid RapidAPI key. Please check your credentials.');
-            } else if (status === 429) {
-                throw new Error('RapidAPI rate limit exceeded. Please check your subscription plan.');
-            } else if (status === 403) {
-                throw new Error('RapidAPI access forbidden. Please check your subscription and permissions.');
-            }
-        }
-        
-        return text; // Return original if translation fails
+// Translate transcript segments in batches using OpenAI with context
+const batchTranslateWithOpenAI = async (transcript, targetLanguage, context, batchSize = 50) => {
+    if (!openaiClient) {
+        throw new Error('OpenAI not initialized. Please set OPENAI_API_KEY.');
     }
-};
 
-// Batch translate for better efficiency with configurable delays
-const batchTranslateText = async (textArray, targetLanguage, batchSize = 10) => {
-    try {
-        if (!translatorAvailable) {
-            throw new Error('RapidAPI Translator not initialized. Please check your API key.');
+    const results = [];
+
+    for (let i = 0; i < transcript.length; i += batchSize) {
+        const batch = transcript.slice(i, i + batchSize);
+        const batchNum = Math.floor(i / batchSize) + 1;
+        const totalBatches = Math.ceil(transcript.length / batchSize);
+        console.log(`🌐 Translating batch ${batchNum}/${totalBatches}`);
+
+        const numberedLines = batch.map((item, idx) => `[${i + idx}] ${item.text}`).join('\n');
+
+        const systemPrompt = `You are a professional translator for ${context.domain || 'general'} content.
+
+Video context:
+- Topic: ${context.topic || 'general'}
+- Key terms: ${(context.keyTerms || []).join(', ')}
+- Tone: ${context.tone || 'neutral'}
+
+Rules:
+- Translate each numbered line to ${targetLanguage}.
+- Preserve the numbering format exactly: [N] translated text
+- Use domain-appropriate terminology for ${targetLanguage}.
+- Keep proper nouns as-is unless they have well-known translations.
+- Do not add, remove, or merge lines. One output line per input line.
+- If a line is a filler word or sound effect, translate naturally or keep as-is.`;
+
+        const response = await openaiClient.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: numberedLines }
+            ],
+            temperature: 0.3
+        });
+
+        const outputText = response.choices[0].message.content;
+
+        // Parse numbered output back into map
+        const translatedMap = {};
+        const lineRegex = /\[(\d+)\]\s*(.+)/g;
+        let match;
+        while ((match = lineRegex.exec(outputText)) !== null) {
+            translatedMap[parseInt(match[1])] = match[2].trim();
         }
 
-        const targetLangCode = getRapidApiLanguageCode(targetLanguage);
-        const results = [];
-        
-        // Process in smaller batches for RapidAPI (rate limiting is more strict)
-        for (let i = 0; i < textArray.length; i += batchSize) {
-            const batch = textArray.slice(i, i + batchSize);
-            
-            console.log(`🌐 Processing translation batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(textArray.length / batchSize)}`);
-            
-            // Process each item in the batch individually for RapidAPI
-            const batchResults = [];
-            for (const item of batch) {
-                if (!item.text || item.text.trim().length < 2) {
-                    batchResults.push({ ...item, translatedText: item.text });
-                    continue;
-                }
-
-                try {
-                    const options = {
-                        method: 'POST',
-                        url: 'https://google-translator9.p.rapidapi.com/v2',
-                        headers: {
-                            'x-rapidapi-key': RAPIDAPI_KEY,
-                            'x-rapidapi-host': RAPIDAPI_HOST,
-                            'Content-Type': 'application/json'
-                        },
-                        data: {
-                            q: item.text.trim(),
-                            source: 'auto',
-                            target: targetLangCode,
-                            format: 'text'
-                        }
-                    };
-
-                    const response = await axios.request(options);
-                    
-                    let translatedText = item.text;
-                    if (response.data && response.data.data && response.data.data.translations && response.data.data.translations.length > 0) {
-                        translatedText = response.data.data.translations[0].translatedText || item.text;
-                    }
-                    
-                    batchResults.push({ ...item, translatedText });
-                    
-                    // Add small delay between individual requests to avoid rate limiting
-                    await new Promise(resolve => setTimeout(resolve, 200));
-                    
-                } catch (itemError) {
-                    console.error(`Translation failed for item: "${item.text.substring(0, 50)}..."`, itemError.message);
-                    batchResults.push({ ...item, translatedText: item.text });
-                    
-                    // Add longer delay after errors
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
-            }
-            
-            results.push(...batchResults);
-            
-            // Add delay between batches to avoid rate limiting
-            if (i + batchSize < textArray.length) {
-                const delayTime = Math.random() * 2000 + 3000; // Random delay between 3-5 seconds
-                console.log(`⏳ Waiting ${Math.round(delayTime/1000)}s before next batch to avoid rate limiting...`);
-                await new Promise(resolve => setTimeout(resolve, delayTime));
-            }
+        // Map back to batch items, falling back to original text
+        let fallbackCount = 0;
+        for (let j = 0; j < batch.length; j++) {
+            const globalIndex = i + j;
+            const translatedText = translatedMap[globalIndex];
+            if (!translatedText) fallbackCount++;
+            results.push({ ...batch[j], translatedText: translatedText || batch[j].text });
         }
-        
-        return results;
-    } catch (error) {
-        console.error('Batch translation error:', error.message);
-        // Return original texts as fallback
-        return textArray.map(item => ({ ...item, translatedText: item.text }));
+
+        if (fallbackCount > 0) {
+            console.warn(`⚠️ ${fallbackCount}/${batch.length} segments fell back to original text in batch ${batchNum}`);
+        }
     }
+
+    return results;
 };
 
-// Generate audio using gTTS
+// Generate audio using OpenAI TTS
 const generateAudio = async (text, language, outputPath) => {
-    return new Promise((resolve, reject) => {
-        // Skip empty or very short text
-        if (!text || text.trim().length < 2) {
-            return reject(new Error('Text too short for TTS'));
-        }
-        
-        // Map common language names to gTTS language codes
-        const languageMap = {
-            'spanish': 'es',
-            'french': 'fr',
-            'german': 'de',
-            'italian': 'it',
-            'portuguese': 'pt',
-            'russian': 'ru',
-            'japanese': 'ja',
-            'korean': 'ko',
-            'chinese': 'zh',
-            'hindi': 'hi',
-            'arabic': 'ar',
-            'dutch': 'nl',
-            'polish': 'pl',
-            'turkish': 'tr',
-            'swedish': 'sv',
-            'norwegian': 'no',
-            'danish': 'da',
-            'finnish': 'fi',
-            'greek': 'el',
-            'hebrew': 'he',
-            'thai': 'th',
-            'vietnamese': 'vi',
-            'indonesian': 'id',
-            'malay': 'ms',
-            'tagalog': 'tl',
-            'urdu': 'ur',
-            'bengali': 'bn',
-            'tamil': 'ta',
-            'telugu': 'te',
-            'marathi': 'mr',
-            'gujarati': 'gu',
-            'kannada': 'kn',
-            'malayalam': 'ml',
-            'punjabi': 'pa'
-        };
+    if (!text || text.trim().length < 2) {
+        throw new Error('Text too short for TTS');
+    }
 
-        const langCode = languageMap[language.toLowerCase()] || 'en';
-        
-        try {
-            const gtts = new gTTS(text.trim(), langCode);
-            
-            gtts.save(outputPath, (err) => {
-                if (err) {
-                    console.error('gTTS error:', err);
-                    reject(err);
-                } else {
-                    resolve(outputPath);
-                }
-            });
-        } catch (error) {
-            console.error('gTTS creation error:', error);
-            reject(error);
-        }
-    });
+    try {
+        const response = await openaiClient.audio.speech.create({
+            model: 'tts-1',
+            voice: 'onyx',
+            input: text.trim(),
+            response_format: 'mp3'
+        });
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        await fs.writeFile(outputPath, buffer);
+        return outputPath;
+    } catch (error) {
+        console.error('OpenAI TTS error:', error.message);
+        throw error;
+    }
 };
 
-// Create silence audio file
+// Create silence audio file using ffmpeg CLI directly
 const createSilence = async (duration, outputPath) => {
-    return new Promise((resolve, reject) => {
-        // Ensure minimum duration and maximum reasonable duration
-        const safeDuration = Math.max(0.1, Math.min(duration, 3600)); // Between 0.1s and 1 hour
-        
-        ffmpeg()
-            .input('anullsrc=channel_layout=stereo:sample_rate=22050')
-            .inputFormat('lavfi')
-            .duration(safeDuration)
-            .audioCodec('pcm_s16le') // Use compatible audio codec
-            .output(outputPath)
-            .on('end', () => {
-                console.log(`Created silence: ${safeDuration}s -> ${outputPath}`);
-                resolve(outputPath);
-            })
-            .on('error', (err) => {
-                console.error('Silence creation error:', err);
-                reject(err);
-            })
-            .run();
-    });
+    const safeDuration = Math.max(0.1, Math.min(duration, 3600));
+    try {
+        await execAsync(
+            `ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=22050 -t ${safeDuration} -c:a pcm_s16le "${outputPath}"`,
+            { timeout: 10000 }
+        );
+        console.log(`Created silence: ${safeDuration}s -> ${outputPath}`);
+        return outputPath;
+    } catch (err) {
+        console.error('Silence creation error:', err.message);
+        throw err;
+    }
 };
 
 // Concatenate audio files
@@ -466,46 +328,107 @@ app.post('/api/check-transcript', async (req, res) => {
     }
 });
 
-// Main dubbing endpoint with RapidAPI Translator
+// Helper: get cache directory for a video+language combo
+const getCacheDir = (videoId, language) => {
+    return path.join(__dirname, 'downloads', 'cache', `${videoId}_${language.toLowerCase()}`);
+};
+
+// Helper: read JSON cache file
+const readCache = async (filePath) => {
+    try {
+        const data = await fs.readFile(filePath, 'utf8');
+        return JSON.parse(data);
+    } catch {
+        return null;
+    }
+};
+
+// Helper: write JSON cache file
+const writeCache = async (filePath, data) => {
+    await fs.writeFile(filePath, JSON.stringify(data));
+};
+
+// Main dubbing endpoint with OpenAI contextual translation
 app.post('/api/dub-video', async (req, res) => {
-    const { videoUrl, targetLanguage } = req.body;
+    const { videoUrl, targetLanguage, contextHint, forceRefresh } = req.body;
     const jobId = uuidv4();
-    
+
     try {
         await ensureDownloadsDir();
-        
+
         console.log('🎬 Starting dubbing process...');
-        
+
         // Step 1: Extract video ID
         const videoId = extractVideoId(videoUrl);
         if (!videoId) {
             return res.status(400).json({ error: 'Invalid YouTube URL' });
         }
-        
+
         console.log('📹 Video ID extracted:', videoId);
-        
-        // Step 2: Enhanced transcript fetching with retry logic
-        console.log('📝 Fetching transcript with enhanced reliability...');
-        
-        let transcript;
-        try {
-            transcript = await fetchTranscript(videoId);
-        } catch (transcriptError) {
-            console.error('❌ Enhanced transcript fetching failed:', transcriptError.message);
-            
-            // Return detailed error with suggestions
-            return res.status(400).json({
-                error: 'Transcript fetching failed',
-                details: transcriptError.message,
-                suggestions: [
-                    'Try a different video with manual captions',
-                    'Check if the video has auto-generated captions enabled',
-                    'Ensure the video is publicly accessible',
-                    'Try again in a few minutes - YouTube may be rate limiting'
-                ]
-            });
+
+        // Set up cache directory
+        const cacheDir = getCacheDir(videoId, targetLanguage);
+        await fs.mkdir(cacheDir, { recursive: true });
+        const transcriptCache = path.join(cacheDir, 'transcript.json');
+        const translationCache = path.join(cacheDir, 'translation.json');
+        const contextCache = path.join(cacheDir, 'context.json');
+        const cachedFinalVideo = path.join(cacheDir, 'dubbed_video.mp4');
+
+        // Check if we already have a completed video
+        if (!forceRefresh) {
+            try {
+                await fs.access(cachedFinalVideo);
+                console.log('✅ Found cached dubbed video, returning immediately');
+                // Copy to job dir for download
+                const jobDir = path.join(__dirname, 'downloads', jobId);
+                await fs.mkdir(jobDir, { recursive: true });
+                await fs.copyFile(cachedFinalVideo, path.join(jobDir, 'dubbed_video.mp4'));
+                const context = await readCache(contextCache);
+                return res.json({
+                    success: true,
+                    jobId,
+                    downloadUrl: `/downloads/${jobId}/dubbed_video.mp4`,
+                    message: 'Video returned from cache! Use "Force Refresh" to re-generate.',
+                    transcriptSegments: 0,
+                    translationErrors: 0,
+                    detectedContext: context || {},
+                    cached: true
+                });
+            } catch {
+                // No cached video, proceed normally
+            }
+        } else {
+            console.log('🔄 Force refresh requested, ignoring cache');
         }
-        
+
+        // Step 2: Fetch transcript (cache it)
+        console.log('📝 Fetching transcript...');
+        let transcript;
+
+        if (!forceRefresh) {
+            transcript = await readCache(transcriptCache);
+            if (transcript) console.log(`✅ Using cached transcript (${transcript.length} segments)`);
+        }
+
+        if (!transcript) {
+            try {
+                transcript = await fetchTranscript(videoId);
+                await writeCache(transcriptCache, transcript);
+            } catch (transcriptError) {
+                console.error('❌ Transcript fetching failed:', transcriptError.message);
+                return res.status(400).json({
+                    error: 'Transcript fetching failed',
+                    details: transcriptError.message,
+                    suggestions: [
+                        'Try a different video with manual captions',
+                        'Check if the video has auto-generated captions enabled',
+                        'Ensure the video is publicly accessible',
+                        'Try again in a few minutes - YouTube may be rate limiting'
+                    ]
+                });
+            }
+        }
+
         if (!transcript || transcript.length === 0) {
             return res.status(400).json({
                 error: 'Empty transcript',
@@ -513,91 +436,116 @@ app.post('/api/dub-video', async (req, res) => {
                 suggestions: ['Try a different video with spoken content and captions']
             });
         }
-        
-        console.log(`✅ Successfully fetched ${transcript.length} transcript segments`);
-        
-        // Log transcript sample for debugging
+
+        console.log(`✅ ${transcript.length} transcript segments`);
         if (transcript.length > 0) {
             console.log('Transcript preview:', transcript.slice(0, 3).map(t => t.text).join(' '));
         }
-        
-        // Step 3: Batch translate transcript using RapidAPI
-        console.log('🌐 Translating transcript using RapidAPI Google Translator...');
-        
+
+        // Step 3: Detect video context (cache it)
+        console.log('🧠 Analyzing video content...');
+        let videoContext;
+
+        if (!forceRefresh) {
+            videoContext = await readCache(contextCache);
+            if (videoContext) console.log(`✅ Using cached context: "${videoContext.topic}"`);
+        }
+
+        if (!videoContext) {
+            try {
+                videoContext = await detectTranscriptContext(transcript, contextHint);
+                await writeCache(contextCache, videoContext);
+                console.log(`✅ Detected: "${videoContext.topic}" (${videoContext.domain})`);
+            } catch (contextError) {
+                console.warn('⚠️ Context detection failed:', contextError.message);
+                videoContext = { topic: 'general', domain: 'general', keyTerms: [], tone: 'neutral' };
+            }
+        }
+
+        // Step 4: Translate transcript (cache it)
         let translatedTranscript;
         let translationErrors = 0;
-        
-        try {
-            translatedTranscript = await batchTranslateText(transcript, targetLanguage);
-            
-            // Count items that weren't translated (same as original)
-            translationErrors = translatedTranscript.filter(item => 
-                item.text === item.translatedText && item.text.trim().length >= 2
-            ).length;
-            
-            console.log(`✅ Translation completed. ${translationErrors} items unchanged.`);
-            
-        } catch (translateError) {
-            console.error('❌ Batch translation failed:', translateError.message);
-            
-            // Fallback to original texts
-            translatedTranscript = transcript.map(item => ({
-                ...item,
-                translatedText: item.text
-            }));
-            translationErrors = transcript.length;
+
+        if (!forceRefresh) {
+            translatedTranscript = await readCache(translationCache);
+            if (translatedTranscript) console.log(`✅ Using cached translation (${translatedTranscript.length} segments)`);
         }
-        
+
+        if (!translatedTranscript) {
+            console.log(`🌐 Translating transcript to ${targetLanguage} with OpenAI...`);
+            try {
+                translatedTranscript = await batchTranslateWithOpenAI(transcript, targetLanguage, videoContext);
+                await writeCache(translationCache, translatedTranscript);
+
+                translationErrors = translatedTranscript.filter(item =>
+                    item.text === item.translatedText && item.text.trim().length >= 2
+                ).length;
+                console.log(`✅ Translation completed. ${translationErrors} items unchanged.`);
+            } catch (translateError) {
+                console.error('❌ Translation failed:', translateError.message);
+                translatedTranscript = transcript.map(item => ({
+                    ...item,
+                    translatedText: item.text
+                }));
+                translationErrors = transcript.length;
+            }
+        }
+
         if (translationErrors > 0) {
             console.warn(`⚠️ ${translationErrors} translation issues occurred. Some text may be in original language.`);
         }
-        
-        // Step 4: Generate audio clips
+
+        // Step 5: Generate audio clips
         console.log('🔊 Generating audio clips...');
         const audioClips = [];
         const tempDir = path.join(__dirname, 'downloads', jobId);
         await fs.mkdir(tempDir, { recursive: true });
-        
+
+        // Generate TTS audio with concurrency for speed
+        const CONCURRENCY = 8;
         let successfulClips = 0;
-        
-        for (let i = 0; i < translatedTranscript.length; i++) {
+        const totalSegments = translatedTranscript.length;
+
+        const generateOne = async (i) => {
             const item = translatedTranscript[i];
-            
-            // Skip very short or empty text
+
             if (!item.translatedText || item.translatedText.trim().length < 2) {
-                console.log(`Skipping empty/short text at line ${i}`);
-                continue;
+                return null;
             }
-            
-            const audioPath = path.join(tempDir, `line_${i}.wav`);
-            
+
+            const audioPath = path.join(tempDir, `line_${i}.mp3`);
+
             try {
                 await generateAudio(item.translatedText, targetLanguage, audioPath);
-                audioClips.push({
-                    path: audioPath,
-                    start: item.start,
-                    duration: item.duration,
-                    index: i
-                });
                 successfulClips++;
-                console.log(`Generated audio ${successfulClips}/${translatedTranscript.length}`);
+                if (successfulClips % 20 === 0 || successfulClips === totalSegments) {
+                    console.log(`Generated audio ${successfulClips}/${totalSegments}`);
+                }
+                return { path: audioPath, start: item.start, duration: item.duration, index: i };
             } catch (audioError) {
                 console.error(`Error generating audio for line ${i}:`, audioError.message);
-                // Create a short silence if TTS fails
                 try {
-                    const silenceDuration = Math.max(item.duration, 0.5); // At least 0.5 seconds
+                    const silenceDuration = Math.max(item.duration, 0.5);
                     const silencePath = path.join(tempDir, `silence_${i}.wav`);
                     await createSilence(silenceDuration, silencePath);
-                    audioClips.push({
-                        path: silencePath,
-                        start: item.start,
-                        duration: silenceDuration,
-                        index: i
-                    });
                     successfulClips++;
+                    return { path: silencePath, start: item.start, duration: silenceDuration, index: i };
                 } catch (silenceError) {
                     console.error(`Failed to create silence for line ${i}:`, silenceError.message);
+                    return null;
                 }
+            }
+        };
+
+        // Process in chunks of CONCURRENCY
+        for (let i = 0; i < totalSegments; i += CONCURRENCY) {
+            const chunk = [];
+            for (let j = i; j < Math.min(i + CONCURRENCY, totalSegments); j++) {
+                chunk.push(generateOne(j));
+            }
+            const results = await Promise.all(chunk);
+            for (const result of results) {
+                if (result) audioClips.push(result);
             }
         }
         
@@ -678,14 +626,23 @@ app.post('/api/dub-video', async (req, res) => {
         await mergeVideoAudio(videoPath, finalAudioPath, finalVideoPath);
         
         console.log('✅ Dubbing completed successfully!');
-        
+
+        // Cache the final video
+        try {
+            await fs.copyFile(finalVideoPath, cachedFinalVideo);
+            console.log('💾 Cached dubbed video for future requests');
+        } catch (cacheErr) {
+            console.warn('⚠️ Failed to cache video:', cacheErr.message);
+        }
+
         res.json({
             success: true,
             jobId,
             downloadUrl: `/downloads/${jobId}/dubbed_video.mp4`,
-            message: 'Video dubbed successfully using RapidAPI Google Translator!',
+            message: 'Video dubbed successfully with AI-powered contextual translation!',
             transcriptSegments: transcript.length,
-            translationErrors: translationErrors
+            translationErrors: translationErrors,
+            detectedContext: videoContext
         });
         
     } catch (error) {
@@ -721,7 +678,7 @@ app.get('/api/health', (req, res) => {
     res.json({ 
         status: 'OK', 
         message: 'YouTube Dubbing API is running',
-        translateStatus: translatorAvailable ? 'RapidAPI Connected' : 'Not Connected'
+        translateStatus: translatorAvailable ? 'OpenAI Connected' : 'Not Connected'
     });
 });
 
@@ -737,7 +694,7 @@ app.use((error, req, res, next) => {
 app.listen(PORT, () => {
     console.log(`🚀 YouTube Dubbing API server running on port ${PORT}`);
     console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
-    console.log(`🔑 RapidAPI Translator Status: ${translatorAvailable ? '✅ Connected' : '❌ Not Connected'}`);
+    console.log(`🔑 OpenAI Translator Status: ${translatorAvailable ? '✅ Connected' : '❌ Not Connected'}`);
 });
 
 module.exports = app;
