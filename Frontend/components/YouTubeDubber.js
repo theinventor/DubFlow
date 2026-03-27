@@ -9,6 +9,8 @@ export default function YouTubeDubber() {
   const [isLoading, setIsLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
+  const [contextHint, setContextHint] = useState('');
+  const [forceRefresh, setForceRefresh] = useState(false);
 
   const languages = [
     { code: 'spanish', name: 'Spanish (Español)' },
@@ -43,7 +45,9 @@ export default function YouTubeDubber() {
         },
         body: JSON.stringify({
           videoUrl,
-          targetLanguage
+          targetLanguage,
+          contextHint: contextHint.trim() || undefined,
+          forceRefresh
         })
       });
 
@@ -64,6 +68,8 @@ export default function YouTubeDubber() {
   const resetForm = () => {
     setVideoUrl('');
     setTargetLanguage('spanish');
+    setContextHint('');
+    setForceRefresh(false);
     setResult(null);
     setError('');
   };
@@ -132,6 +138,31 @@ export default function YouTubeDubber() {
                   </div>
                 </div>
 
+                {/* Context Hint */}
+                <div>
+                  <label className="block text-white text-sm font-medium mb-3">
+                    Context Hint (Optional)
+                  </label>
+                  <textarea
+                    value={contextHint}
+                    onChange={(e) => setContextHint(e.target.value)}
+                    placeholder="E.g., 'This is a video about fixing a snowmobile engine' — helps the AI use the right terminology"
+                    rows={2}
+                    className="w-full px-4 py-3 bg-white/10 border border-white/20 rounded-2xl text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-400 focus:border-transparent transition-all duration-300 resize-none"
+                  />
+                </div>
+
+                {/* Force Refresh */}
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={forceRefresh}
+                    onChange={(e) => setForceRefresh(e.target.checked)}
+                    className="w-4 h-4 rounded border-white/20 bg-white/10 text-purple-500 focus:ring-purple-400"
+                  />
+                  <span className="text-gray-300 text-sm">Force refresh (ignore cached results)</span>
+                </label>
+
                 {/* Error Message */}
                 {error && (
                   <div className="flex items-center gap-3 p-4 bg-red-500/20 border border-red-500/30 rounded-2xl">
@@ -178,8 +209,12 @@ export default function YouTubeDubber() {
                       <span className="text-sm">Extracting transcript</span>
                     </div>
                     <div className="flex items-center justify-center gap-3 text-purple-300">
+                      <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-150"></div>
+                      <span className="text-sm">Analyzing video context</span>
+                    </div>
+                    <div className="flex items-center justify-center gap-3 text-purple-300">
                       <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-300"></div>
-                      <span className="text-sm">Translating content</span>
+                      <span className="text-sm">Translating with context</span>
                     </div>
                     <div className="flex items-center justify-center gap-3 text-purple-300">
                       <div className="w-2 h-2 bg-purple-400 rounded-full animate-pulse delay-700"></div>
@@ -232,6 +267,21 @@ export default function YouTubeDubber() {
                   </div>
                 </div>
               </div>
+
+              {/* Detected Context */}
+              {result.detectedContext && result.detectedContext.topic && (
+                <div className="bg-white/5 rounded-2xl p-4 border border-white/10 mb-8">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 bg-purple-500/20 rounded-xl flex items-center justify-center">
+                      <span className="text-purple-400 text-lg">🧠</span>
+                    </div>
+                    <div>
+                      <p className="text-white font-semibold">{result.detectedContext.topic}</p>
+                      <p className="text-gray-400 text-sm">Detected Context — {result.detectedContext.tone} tone</p>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Video Player */}
               <div className="mb-6">
