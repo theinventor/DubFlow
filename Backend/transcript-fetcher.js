@@ -12,13 +12,18 @@ const execAsync = promisify(exec);
 const fetchWithYtDlp = async (videoId) => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dubflow-'));
     const outPath = path.join(tmpDir, 'sub');
+    const cmd = `yt-dlp --write-auto-sub --write-sub --sub-lang en --sub-format json3 --skip-download -o "${outPath}" "https://www.youtube.com/watch?v=${videoId}"`;
 
     try {
         console.log('📝 Fetching transcript via yt-dlp...');
-        await execAsync(
-            `yt-dlp --write-auto-sub --write-sub --sub-lang en --sub-format json3 --skip-download -o "${outPath}" "https://www.youtube.com/watch?v=${videoId}"`,
-            { timeout: 30000 }
-        );
+        console.log(`   Command: ${cmd}`);
+        const { stdout, stderr } = await execAsync(cmd, { timeout: 30000 });
+        if (stdout) console.log(`   yt-dlp stdout: ${stdout.trim()}`);
+        if (stderr) console.log(`   yt-dlp stderr: ${stderr.trim()}`);
+
+        // List files in tmpDir to see what yt-dlp actually wrote
+        const files = await fs.readdir(tmpDir);
+        console.log(`   yt-dlp wrote files: ${JSON.stringify(files)}`);
 
         const subFile = path.join(tmpDir, 'sub.en.json3');
         const raw = await fs.readFile(subFile, 'utf8');
@@ -39,6 +44,14 @@ const fetchWithYtDlp = async (videoId) => {
 
         console.log(`✅ yt-dlp fetched ${segments.length} segments`);
         return segments;
+    } catch (error) {
+        // Log the full error details before re-throwing
+        console.error(`❌ yt-dlp error for video ${videoId}:`);
+        console.error(`   message: ${error.message}`);
+        if (error.stdout) console.error(`   stdout: ${error.stdout.trim()}`);
+        if (error.stderr) console.error(`   stderr: ${error.stderr.trim()}`);
+        if (error.code) console.error(`   exit code: ${error.code}`);
+        throw error;
     } finally {
         // Clean up temp files
         await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -65,7 +78,8 @@ const fetchWithNpmPackage = async (videoId) => {
                 }));
             }
         } catch (error) {
-            console.log(`npm package failed (${langCode || 'auto'}): ${error.message}`);
+            console.error(`   npm package failed (${langCode || 'auto'}): ${error.message}`);
+            if (error.stack) console.error(`   stack: ${error.stack.split('\n').slice(0,3).join(' | ')}`);
         }
     }
 
@@ -78,26 +92,34 @@ const fetchTranscript = async (videoId) => {
         throw new Error('Invalid YouTube video ID format');
     }
 
+    let ytdlpError, npmError;
+
     // Try yt-dlp first (handles auto-generated captions)
     try {
         return await fetchWithYtDlp(videoId);
-    } catch (ytdlpError) {
-        console.log(`yt-dlp failed: ${ytdlpError.message}`);
+    } catch (err) {
+        ytdlpError = err;
+        console.error(`❌ yt-dlp method failed: ${err.message}`);
     }
 
     // Fall back to npm package
     try {
         return await fetchWithNpmPackage(videoId);
-    } catch (npmError) {
-        console.log(`npm fallback failed: ${npmError.message}`);
+    } catch (err) {
+        npmError = err;
+        console.error(`❌ npm fallback method failed: ${err.message}`);
     }
+
+    const detail = `yt-dlp: ${ytdlpError?.message || 'unknown'} | npm: ${npmError?.message || 'unknown'}`;
+    console.error(`❌ All transcript methods failed for ${videoId}. Details: ${detail}`);
 
     throw new Error(
         'No transcript/captions found for this video. ' +
         'Please ensure the video has either:\n' +
         '• Manual captions/subtitles\n' +
         '• Auto-generated captions enabled\n' +
-        '• Public accessibility settings'
+        '• Public accessibility settings\n' +
+        `\nDebug: ${detail}`
     );
 };
 
