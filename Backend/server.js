@@ -234,42 +234,30 @@ const concatenateAudio = async (audioFiles, outputPath) => {
 
 // Download video using yt-dlp (more reliable than ytdl-core)
 const downloadVideoOnly = async (videoId, outputPath) => {
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+    // Download video+audio together (we need original audio for background mixing)
+    // Cap at 1080p — re-encoding 4K for caption burning is extremely slow
     try {
-        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-        
-        // Use yt-dlp which is more reliable than ytdl-core
-        const command = `yt-dlp -f "bestvideo[ext=mp4]" --no-audio -o "${outputPath}" "${videoUrl}"`;
-        
+        const command = `yt-dlp -f "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]" --merge-output-format mp4 -o "${outputPath}" "${videoUrl}"`;
         console.log('Executing:', command);
-        const { stdout, stderr } = await execAsync(command);
-        
-        if (stderr && !stderr.includes('WARNING')) {
-            console.error('yt-dlp stderr:', stderr);
-        }
-        
-        // Check if file was created
-        try {
-            await fs.access(outputPath);
-            return outputPath;
-        } catch {
-            throw new Error('Video file was not created successfully');
-        }
-        
+        const { stderr } = await execAsync(command, { timeout: 300000 });
+        if (stderr && !stderr.includes('WARNING')) console.error('yt-dlp stderr:', stderr);
+        await fs.access(outputPath);
+        return outputPath;
     } catch (error) {
-        console.error('yt-dlp error:', error);
-        
-        // Fallback: try with different format
-        try {
-            const fallbackCommand = `yt-dlp -f "best[ext=mp4]" --no-audio -o "${outputPath}" "https://www.youtube.com/watch?v=${videoId}"`;
-            console.log('Trying fallback:', fallbackCommand);
-            await execAsync(fallbackCommand);
-            
-            // Check if file was created
-            await fs.access(outputPath);
-            return outputPath;
-        } catch (fallbackError) {
-            throw new Error(`Failed to download video: ${error.message}. Fallback also failed: ${fallbackError.message}`);
-        }
+        console.error('yt-dlp error:', error.message);
+    }
+
+    // Fallback
+    try {
+        const fallbackCommand = `yt-dlp -f "best[height<=1080][ext=mp4]" -o "${outputPath}" "${videoUrl}"`;
+        console.log('Trying fallback:', fallbackCommand);
+        await execAsync(fallbackCommand, { timeout: 300000 });
+        await fs.access(outputPath);
+        return outputPath;
+    } catch (fallbackError) {
+        throw new Error(`Failed to download video: ${fallbackError.message}`);
     }
 };
 
@@ -318,9 +306,16 @@ const generateSrtFile = async (translatedTranscript, outputPath) => {
     return outputPath;
 };
 
-// Merge video, audio, and burned-in subtitles
+// Get video duration in seconds via ffprobe
+const getVideoDuration = async (videoPath) => {
+    try {
+        const { stdout } = await execAsync(`ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`);
+        return parseFloat(stdout.trim()) || 0;
+    } catch { return 0; }
+};
+
+// Merge video + dubbed audio + original audio (quiet) + optional subtitles
 const mergeVideoAudio = async (videoPath, audioPath, outputPath, subtitlePath = null, position = 'bottom') => {
-    // Use ffmpeg CLI directly for subtitle burning — fluent-ffmpeg escaping is unreliable
     const escapedSubPath = subtitlePath ? subtitlePath.replace(/'/g, "'\\''").replace(/:/g, '\\:') : null;
 
     // ASS alignment: 8=top-center, 5=middle-center, 2=bottom-center
@@ -328,20 +323,41 @@ const mergeVideoAudio = async (videoPath, audioPath, outputPath, subtitlePath = 
     const alignment = alignMap[position] || 2;
     const marginV = position === 'middle' ? 0 : 30;
 
-    const vf = subtitlePath
-        ? `-vf "subtitles='${escapedSubPath}':force_style='Fontsize=24,PrimaryColour=&Hffffff,BackColour=&H80000000,BorderStyle=4,Outline=0,Shadow=0,Alignment=${alignment},MarginV=${marginV}'"`
-        : '-c:v copy';
+    // Mix original audio at 10% volume with dubbed audio at full volume
+    const audioFilter = `[0:a]volume=0.10[bg];[1:a]volume=1.0[dub];[bg][dub]amix=inputs=2:duration=shortest[aout]`;
 
-    const cmd = subtitlePath
-        ? `ffmpeg -y -i "${videoPath}" -i "${audioPath}" ${vf} -c:a aac -strict experimental -shortest "${outputPath}"`
-        : `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -c:v copy -c:a aac -strict experimental -shortest "${outputPath}"`;
+    let vf = '';
+    let videoCodec = '-c:v copy';
+
+    if (subtitlePath) {
+        // For long videos (>60 min), scale to 480p to keep encode time reasonable
+        const duration = await getVideoDuration(videoPath);
+        const scale = duration > 3600 ? 'scale=-2:480,' : '';
+        const fontSize = duration > 3600 ? 16 : 24;
+        const resLabel = duration > 3600 ? '480p' : 'full resolution';
+
+        vf = `-vf "${scale}subtitles='${escapedSubPath}':force_style='Fontsize=${fontSize},PrimaryColour=&Hffffff,BackColour=&H80000000,BorderStyle=4,Outline=0,Shadow=0,Alignment=${alignment},MarginV=${marginV}'"`;
+        videoCodec = '-preset fast';
+
+        console.log(`Video duration: ${Math.round(duration)}s — re-encoding at ${resLabel}`);
+    }
+
+    const cmd = `ffmpeg -y -i "${videoPath}" -i "${audioPath}" -filter_complex "${audioFilter}" ${vf} ${videoCodec} -map 0:v -map "[aout]" -c:a aac -strict experimental -shortest "${outputPath}"`;
 
     try {
-        console.log('Running FFmpeg merge' + (subtitlePath ? ' with burned-in captions' : '') + '...');
-        await execAsync(cmd, { timeout: 600000 }); // 10 min timeout for re-encoding
+        const label = subtitlePath ? 'with burned-in captions (re-encoding)' : 'with background audio mix';
+        console.log(`Running FFmpeg merge ${label}...`);
+        console.log(`FFmpeg command: ${cmd}`);
+        await execAsync(cmd, { timeout: 7200000 }); // 2 hour timeout
+        console.log('✅ FFmpeg merge complete');
         return outputPath;
     } catch (error) {
-        console.error('FFmpeg merge error:', error.message);
+        if (error.killed && error.signal === 'SIGTERM') {
+            console.error('❌ FFmpeg timed out after 2 hours.');
+            throw new Error('FFmpeg timed out after 2 hours. The video may be too long for caption burning on this server.');
+        }
+        console.error('❌ FFmpeg merge error:', error.message);
+        if (error.stderr) console.error('FFmpeg stderr (last 500 chars):', error.stderr.slice(-500));
         throw error;
     }
 };
@@ -392,7 +408,7 @@ const writeCache = async (filePath, data) => {
 
 // Main dubbing endpoint with SSE progress streaming
 app.post('/api/dub-video', async (req, res) => {
-    const { videoUrl, targetLanguage, contextHint, forceRefresh, burnCaptions, captionPosition } = req.body;
+    const { videoUrl, targetLanguage, contextHint, forceRefresh, burnCaptions, captionPosition, remerge } = req.body;
     const jobId = uuidv4();
 
     // Set up SSE
@@ -431,10 +447,11 @@ app.post('/api/dub-video', async (req, res) => {
         const transcriptCache = path.join(cacheDir, 'transcript.json');
         const translationCache = path.join(cacheDir, 'translation.json');
         const contextCache = path.join(cacheDir, 'context.json');
+        const cachedAudio = path.join(cacheDir, 'final_audio.wav');
         const cachedFinalVideo = path.join(cacheDir, 'dubbed_video.mp4');
 
-        // Check cache
-        if (!forceRefresh) {
+        // Check cache (remerge skips final video cache but keeps intermediate caches)
+        if (!forceRefresh && !remerge) {
             try {
                 await fs.access(cachedFinalVideo);
                 console.log('✅ Found cached dubbed video');
@@ -457,7 +474,7 @@ app.post('/api/dub-video', async (req, res) => {
         }
 
         // Step 1: Fetch transcript
-        sendProgress('transcript', 'Fetching transcript...');
+        sendProgress('transcript', 'Fetching transcript...', 0);
         let transcript;
 
         if (!forceRefresh) {
@@ -466,7 +483,9 @@ app.post('/api/dub-video', async (req, res) => {
         }
 
         if (!transcript) {
+            sendProgress('transcript', 'Downloading captions...', 30);
             transcript = await fetchTranscript(videoId);
+            sendProgress('transcript', 'Saving transcript...', 80);
             await writeCache(transcriptCache, transcript);
         }
 
@@ -479,15 +498,17 @@ app.post('/api/dub-video', async (req, res) => {
         console.log(`✅ ${transcript.length} transcript segments`);
 
         // Step 2: Detect context
-        sendProgress('context', 'Analyzing video content...');
+        sendProgress('context', 'Analyzing video content...', 0);
         let videoContext;
 
         if (!forceRefresh) {
             videoContext = await readCache(contextCache);
+            if (videoContext) sendProgress('context', `Detected: ${videoContext.topic}`, 100);
         }
 
         if (!videoContext) {
             try {
+                sendProgress('context', 'Detecting domain and terminology...', 30);
                 videoContext = await detectTranscriptContext(transcript, contextHint);
                 await writeCache(contextCache, videoContext);
             } catch (contextError) {
@@ -561,105 +582,147 @@ app.post('/api/dub-video', async (req, res) => {
 
         sendProgress('translate', 'Translation complete', 100);
 
-        // Step 4: Generate audio
-        const audioClips = [];
+        // Step 4: Generate audio + download video in parallel
         const tempDir = path.join(__dirname, 'downloads', jobId);
         await fs.mkdir(tempDir, { recursive: true });
 
-        const CONCURRENCY = 8;
-        let successfulClips = 0;
-        const totalSegments = translatedTranscript.length;
-
-        sendProgress('audio', 'Generating audio...', 0, `0/${totalSegments}`);
-
-        const generateOne = async (i) => {
-            const item = translatedTranscript[i];
-            if (!item.translatedText || item.translatedText.trim().length < 2) return null;
-
-            const audioPath = path.join(tempDir, `line_${i}.mp3`);
+        // Start video download immediately (runs in background)
+        const videoPath = path.join(tempDir, 'video.mp4');
+        sendProgress('download', 'Downloading video...', 0);
+        const videoDownloadPromise = (async () => {
             try {
-                await generateAudio(item.translatedText, targetLanguage, audioPath);
-                successfulClips++;
-                return { path: audioPath, start: item.start, duration: item.duration, index: i };
-            } catch (audioError) {
-                try {
-                    const silenceDuration = Math.max(item.duration, 0.5);
-                    const silencePath = path.join(tempDir, `silence_${i}.wav`);
-                    await createSilence(silenceDuration, silencePath);
-                    successfulClips++;
-                    return { path: silencePath, start: item.start, duration: silenceDuration, index: i };
-                } catch { return null; }
+                await downloadVideoOnly(videoId, videoPath);
+            } catch (error) {
+                try { await downloadVideoWithYoutubeDl(videoId, videoPath); }
+                catch (fb) { throw new Error(`Video download failed: ${error.message}`); }
             }
-        };
-
-        for (let i = 0; i < totalSegments; i += CONCURRENCY) {
-            const chunk = [];
-            for (let j = i; j < Math.min(i + CONCURRENCY, totalSegments); j++) {
-                chunk.push(generateOne(j));
-            }
-            const results = await Promise.all(chunk);
-            for (const result of results) {
-                if (result) audioClips.push(result);
-            }
-            const pct = Math.round((Math.min(i + CONCURRENCY, totalSegments) / totalSegments) * 100);
-            sendProgress('audio', 'Generating audio...', pct, `${successfulClips}/${totalSegments}`);
-        }
-
-        if (audioClips.length === 0) throw new Error('No audio clips generated');
-
-        sendProgress('audio', `Generated ${audioClips.length} audio clips`, 100);
-
-        // Step 5: Align + concatenate
-        sendProgress('merge', 'Aligning and concatenating audio...');
-        const alignedAudioFiles = [];
-        audioClips.sort((a, b) => a.start - b.start);
-        let currentTime = 0;
-
-        for (let i = 0; i < audioClips.length; i++) {
-            const clip = audioClips[i];
-            if (clip.start > currentTime) {
-                const silenceDuration = clip.start - currentTime;
-                if (silenceDuration > 0.1) {
-                    const silencePath = path.join(tempDir, `gap_${i}_${Date.now()}.wav`);
-                    try {
-                        await createSilence(silenceDuration, silencePath);
-                        alignedAudioFiles.push(silencePath);
-                    } catch {}
-                }
-            }
-            alignedAudioFiles.push(clip.path);
-            currentTime = clip.start + clip.duration;
-        }
+            sendProgress('download', 'Video downloaded', 100);
+            console.log('✅ Video download complete');
+        })();
 
         const finalAudioPath = path.join(tempDir, 'final_audio.wav');
-        try {
-            await concatenateAudio(alignedAudioFiles, finalAudioPath);
-        } catch {
-            const totalDuration = Math.max(...audioClips.map(clip => clip.start + clip.duration));
-            await createSilence(totalDuration || 10, finalAudioPath);
+
+        // Check if we have cached audio
+        let audioCached = false;
+        if (!forceRefresh) {
+            try {
+                await fs.access(cachedAudio);
+                await fs.copyFile(cachedAudio, finalAudioPath);
+                sendProgress('audio', 'Using cached audio', 100);
+                sendProgress('align', 'Using cached audio', 100);
+                console.log('✅ Using cached audio');
+                audioCached = true;
+            } catch { /* no cached audio */ }
         }
 
-        // Step 6: Download video
-        sendProgress('merge', 'Downloading video...');
-        const videoPath = path.join(tempDir, 'video.mp4');
-        try {
-            await downloadVideoOnly(videoId, videoPath);
-        } catch (error) {
-            try { await downloadVideoWithYoutubeDl(videoId, videoPath); }
-            catch (fb) { throw new Error(`Video download failed: ${error.message}`); }
+        if (!audioCached) {
+            // Generate TTS audio concurrently with video download
+            const audioClips = [];
+            const CONCURRENCY = 8;
+            let successfulClips = 0;
+            const totalSegments = translatedTranscript.length;
+
+            sendProgress('audio', 'Generating audio...', 0, `0/${totalSegments}`);
+
+            const generateOne = async (i) => {
+                const item = translatedTranscript[i];
+                if (!item.translatedText || item.translatedText.trim().length < 2) return null;
+
+                const audioPath = path.join(tempDir, `line_${i}.mp3`);
+                try {
+                    await generateAudio(item.translatedText, targetLanguage, audioPath);
+                    successfulClips++;
+                    return { path: audioPath, start: item.start, duration: item.duration, index: i };
+                } catch (audioError) {
+                    try {
+                        const silenceDuration = Math.max(item.duration, 0.5);
+                        const silencePath = path.join(tempDir, `silence_${i}.wav`);
+                        await createSilence(silenceDuration, silencePath);
+                        successfulClips++;
+                        return { path: silencePath, start: item.start, duration: silenceDuration, index: i };
+                    } catch { return null; }
+                }
+            };
+
+            for (let i = 0; i < totalSegments; i += CONCURRENCY) {
+                const chunk = [];
+                for (let j = i; j < Math.min(i + CONCURRENCY, totalSegments); j++) {
+                    chunk.push(generateOne(j));
+                }
+                const results = await Promise.all(chunk);
+                for (const result of results) {
+                    if (result) audioClips.push(result);
+                }
+                const pct = Math.round((Math.min(i + CONCURRENCY, totalSegments) / totalSegments) * 100);
+                sendProgress('audio', 'Generating audio...', pct, `${successfulClips}/${totalSegments}`);
+            }
+
+            if (audioClips.length === 0) throw new Error('No audio clips generated');
+
+            sendProgress('audio', `Generated ${audioClips.length} audio clips`, 100);
+
+            // Step 5: Align + concatenate audio
+            sendProgress('align', 'Aligning and concatenating audio...', 0);
+            const alignedAudioFiles = [];
+            audioClips.sort((a, b) => a.start - b.start);
+            let currentTime = 0;
+            const totalClips = audioClips.length;
+
+            for (let i = 0; i < totalClips; i++) {
+                const clip = audioClips[i];
+                if (clip.start > currentTime) {
+                    const silenceDuration = clip.start - currentTime;
+                    if (silenceDuration > 0.1) {
+                        const silencePath = path.join(tempDir, `gap_${i}_${Date.now()}.wav`);
+                        try {
+                            await createSilence(silenceDuration, silencePath);
+                            alignedAudioFiles.push(silencePath);
+                        } catch {}
+                    }
+                }
+                alignedAudioFiles.push(clip.path);
+                currentTime = clip.start + clip.duration;
+
+                if (i % 50 === 0 || i === totalClips - 1) {
+                    const pct = Math.round(((i + 1) / totalClips) * 80);
+                    sendProgress('align', 'Aligning audio clips...', pct, `${i + 1}/${totalClips}`);
+                }
+            }
+
+            sendProgress('align', 'Concatenating final audio...', 85);
+            try {
+                await concatenateAudio(alignedAudioFiles, finalAudioPath);
+            } catch {
+                const totalDuration = Math.max(...audioClips.map(clip => clip.start + clip.duration));
+                await createSilence(totalDuration || 10, finalAudioPath);
+            }
+            sendProgress('align', 'Audio aligned', 100);
+
+            // Cache the final audio for future runs
+            try {
+                await fs.copyFile(finalAudioPath, cachedAudio);
+                console.log('✅ Cached final audio');
+            } catch {}
         }
+
+        // Wait for video download to finish (should already be done)
+        await videoDownloadPromise;
 
         // Step 7: Subtitles + merge
+        const finalVideoPath = path.join(tempDir, 'dubbed_video.mp4');
         let subtitlePath = null;
+
         if (burnCaptions) {
-            sendProgress('merge', 'Generating subtitles...');
+            sendProgress('merge', 'Generating subtitles...', 10);
             subtitlePath = path.join(tempDir, 'subtitles.srt');
             await generateSrtFile(translatedTranscript, subtitlePath);
+            sendProgress('merge', 'Merging video, audio, and captions...', 20);
+        } else {
+            sendProgress('merge', 'Merging video and audio...', 20);
         }
 
-        sendProgress('merge', burnCaptions ? 'Merging video, audio, and captions...' : 'Merging video and audio...');
-        const finalVideoPath = path.join(tempDir, 'dubbed_video.mp4');
         await mergeVideoAudio(videoPath, finalAudioPath, finalVideoPath, subtitlePath, captionPosition);
+        sendProgress('merge', 'Merge complete', 100);
 
         // Cache
         try {

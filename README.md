@@ -26,26 +26,40 @@ Transform any YouTube video into multiple languages with AI-powered dubbing. Dub
 | **Transcript** | yt-dlp (primary), youtube-transcript (fallback) |
 | **Video Processing** | FFmpeg, yt-dlp |
 
+## Quick Start
+
+```bash
+git clone https://github.com/theinventor/DubFlow.git
+cd DubFlow
+./setup.sh
+```
+
+The setup script handles everything: checks Node.js v18+, installs FFmpeg, installs the **latest** yt-dlp directly from GitHub releases, installs npm dependencies for both backend and frontend, and prompts for your OpenAI API key.
+
+Then start the app:
+
+```bash
+# Terminal 1 — Backend
+cd Backend && node server.js
+
+# Terminal 2 — Frontend
+cd Frontend && npm run dev
+```
+
+Open http://localhost:3000
+
 ## Prerequisites
 
-- Node.js v18+
-- FFmpeg
-- yt-dlp
-- OpenAI API key
+- **Node.js v18+** — [nodejs.org](https://nodejs.org/)
+- **FFmpeg** — installed by `setup.sh`, or manually: `brew install ffmpeg` / `sudo apt install ffmpeg`
+- **yt-dlp** — installed by `setup.sh` from [GitHub releases](https://github.com/yt-dlp/yt-dlp/releases/latest) (see note below)
+- **OpenAI API key** — [platform.openai.com](https://platform.openai.com/api-keys)
 
-### Install system dependencies
+> **Important:** Do not install yt-dlp from apt or brew — those packages are often months behind and will fail with YouTube API changes. The setup script installs the latest binary directly from GitHub. To update later: `sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && sudo chmod a+rx /usr/local/bin/yt-dlp`
 
-**macOS:**
-```bash
-brew install ffmpeg yt-dlp
-```
+## Manual Setup
 
-**Ubuntu/Debian:**
-```bash
-sudo apt update && sudo apt install ffmpeg yt-dlp
-```
-
-## Setup
+If you prefer not to use the setup script:
 
 1. **Clone the repository**
    ```bash
@@ -53,13 +67,25 @@ sudo apt update && sudo apt install ffmpeg yt-dlp
    cd DubFlow
    ```
 
-2. **Install dependencies**
+2. **Install system dependencies**
+
+   ```bash
+   # FFmpeg
+   brew install ffmpeg          # macOS
+   sudo apt install ffmpeg      # Ubuntu/Debian
+
+   # yt-dlp (always install from GitHub releases, not apt/brew)
+   sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+   sudo chmod a+rx /usr/local/bin/yt-dlp
+   ```
+
+3. **Install npm dependencies**
    ```bash
    cd Backend && npm install
    cd ../Frontend && npm install
    ```
 
-3. **Configure environment variables**
+4. **Configure environment variables**
 
    Create `Backend/.env`:
    ```env
@@ -67,7 +93,7 @@ sudo apt update && sudo apt install ffmpeg yt-dlp
    PORT=3001
    ```
 
-4. **Run the app**
+5. **Run the app**
 
    Terminal 1 (backend):
    ```bash
@@ -79,7 +105,7 @@ sudo apt update && sudo apt install ffmpeg yt-dlp
    cd Frontend && npm run dev
    ```
 
-5. Open http://localhost:3000
+6. Open http://localhost:3000
 
 ## How It Works
 
@@ -189,11 +215,15 @@ Same video + same language = instant return. Different language = reuses cached 
 
 **"No transcript found"** — Make sure the video has captions (auto-generated or manual). yt-dlp handles auto-captions well, but some videos have none.
 
+**yt-dlp errors / "Precondition check failed" / "Unable to extract"** — Your yt-dlp is outdated. YouTube changes their internal API frequently, which breaks older versions. Install the latest directly from GitHub (do **not** use `apt` or `brew` — those lag behind):
+```bash
+sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+sudo chmod a+rx /usr/local/bin/yt-dlp
+```
+
 **Translation quality** — Use the "Context Hint" field to tell the AI what the video is about. This dramatically improves domain-specific terminology.
 
 **Slow processing** — The TTS step is the bottleneck (one API call per segment, 8 concurrent). A 500-segment video takes a few minutes.
-
-**yt-dlp errors** — Keep yt-dlp updated: `brew upgrade yt-dlp`
 
 ## Acknowledgments
 

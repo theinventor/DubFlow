@@ -1,13 +1,22 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import { Play, Download, Globe, Zap, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { Play, Download, Globe, Zap, CheckCircle, AlertCircle, Loader2, Subtitles } from 'lucide-react';
+
+// Derive backend URL from current hostname so it works on localhost and remote hosts
+const getBackendUrl = () => {
+  if (typeof window === 'undefined') return 'http://localhost:3001';
+  const hostname = window.location.hostname;
+  return `http://${hostname}:3001`;
+};
 
 const STEPS = [
   { key: 'transcript', label: 'Extracting transcript' },
   { key: 'context', label: 'Analyzing context' },
   { key: 'translate', label: 'Translating' },
+  { key: 'download', label: 'Downloading video' },
   { key: 'audio', label: 'Generating audio' },
+  { key: 'align', label: 'Aligning audio' },
   { key: 'merge', label: 'Merging video' },
 ];
 
@@ -21,42 +30,9 @@ export default function YouTubeDubber() {
   const [forceRefresh, setForceRefresh] = useState(false);
   const [burnCaptions, setBurnCaptions] = useState(false);
   const [captionPosition, setCaptionPosition] = useState('bottom');
-  const [progress, setProgress] = useState(null); // { step, label, progress, detail }
+  const [progress, setProgress] = useState(null); // latest SSE event: { step, label, progress, detail }
+  const [stepStates, setStepStates] = useState({}); // { [stepKey]: { label, progress, detail } }
   const [recovering, setRecovering] = useState(false);
-
-  // On mount, check URL params for in-progress or completed job
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const v = params.get('v');
-    const lang = params.get('lang');
-    if (!v || !lang) return;
-
-    setRecovering(true);
-    setIsLoading(true);
-    setProgress({ step: 'merge', label: 'Checking for completed video...', progress: null, detail: null });
-
-    let cancelled = false;
-
-    const poll = async () => {
-      while (!cancelled) {
-        try {
-          const res = await fetch(`http://localhost:3001/api/cache-status/${v}/${lang}`);
-          const data = await res.json();
-          if (data.status === 'completed') {
-            setResult(data);
-            setIsLoading(false);
-            setRecovering(false);
-            return;
-          }
-        } catch {}
-        // Wait 3 seconds before polling again
-        await new Promise(r => setTimeout(r, 3000));
-      }
-    };
-
-    poll();
-    return () => { cancelled = true; };
-  }, []);
 
   const languages = [
     { code: 'spanish', name: 'Spanish (Español)' },
@@ -77,25 +53,19 @@ export default function YouTubeDubber() {
     { code: 'vietnamese', name: 'Vietnamese (Tiếng Việt)' }
   ];
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
+  // Shared function: start a dub job and stream SSE progress
+  const startDubJob = useCallback(async (opts) => {
     setIsLoading(true);
     setError('');
     setResult(null);
     setProgress(null);
+    setStepStates({});
 
     try {
-      const response = await fetch('http://localhost:3001/api/dub-video', {
+      const response = await fetch(`${getBackendUrl()}/api/dub-video`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          videoUrl,
-          targetLanguage,
-          contextHint: contextHint.trim() || undefined,
-          forceRefresh,
-          burnCaptions,
-          captionPosition: burnCaptions ? captionPosition : undefined
-        })
+        body: JSON.stringify(opts)
       });
 
       const reader = response.body.getReader();
@@ -108,7 +78,7 @@ export default function YouTubeDubber() {
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep incomplete line in buffer
+        buffer = lines.pop();
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
@@ -119,19 +89,22 @@ export default function YouTubeDubber() {
               throw new Error(data.error);
             }
 
-            // Backend sends videoId early — update URL for recovery
             if (data.videoId) {
               const url = new URL(window.location);
               url.searchParams.set('v', data.videoId);
-              url.searchParams.set('lang', targetLanguage);
+              url.searchParams.set('lang', opts.targetLanguage);
               window.history.replaceState({}, '', url);
               continue;
             }
 
             if (data.done) {
               setResult(data);
-            } else {
+            } else if (data.step) {
               setProgress(data);
+              setStepStates(prev => ({
+                ...prev,
+                [data.step]: { label: data.label, progress: data.progress, detail: data.detail }
+              }));
             }
           } catch (parseErr) {
             if (parseErr.message && !parseErr.message.includes('JSON')) {
@@ -144,7 +117,53 @@ export default function YouTubeDubber() {
       setError(err.message || 'Something went wrong. Please try again.');
     } finally {
       setIsLoading(false);
+      setRecovering(false);
     }
+  }, []);
+
+  // On mount, check URL params — if cached result exists show it, otherwise start the dub job
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const v = params.get('v');
+    const lang = params.get('lang');
+    if (!v || !lang) return;
+
+    setRecovering(true);
+    setVideoUrl(`https://www.youtube.com/watch?v=${v}`);
+    setTargetLanguage(lang);
+
+    const recover = async () => {
+      // Check cache first
+      try {
+        const res = await fetch(`${getBackendUrl()}/api/cache-status/${v}/${lang}`);
+        const data = await res.json();
+        if (data.status === 'completed') {
+          setResult(data);
+          setRecovering(false);
+          return;
+        }
+      } catch {}
+
+      // No cache — start a real dub job with full SSE progress
+      await startDubJob({
+        videoUrl: `https://www.youtube.com/watch?v=${v}`,
+        targetLanguage: lang
+      });
+    };
+
+    recover();
+  }, [startDubJob]);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    await startDubJob({
+      videoUrl,
+      targetLanguage,
+      contextHint: contextHint.trim() || undefined,
+      forceRefresh,
+      burnCaptions,
+      captionPosition: burnCaptions ? captionPosition : undefined
+    });
   };
 
   const resetForm = () => {
@@ -157,12 +176,18 @@ export default function YouTubeDubber() {
     setResult(null);
     setError('');
     setProgress(null);
+    setStepStates({});
     setRecovering(false);
     window.history.replaceState({}, '', window.location.pathname);
   };
 
-  // Determine which step index is active
-  const activeStepIndex = progress ? STEPS.findIndex(s => s.key === progress.step) : -1;
+  // Determine step status from stepStates
+  const getStepStatus = (stepKey) => {
+    const state = stepStates[stepKey];
+    if (!state) return 'pending';
+    if (state.progress >= 100) return 'done';
+    return 'active';
+  };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-violet-900 via-purple-900 to-indigo-900 relative overflow-hidden">
@@ -318,10 +343,12 @@ export default function YouTubeDubber() {
 
                 {/* Steps */}
                 <div className="space-y-4">
-                  {STEPS.map((step, idx) => {
-                    const isActive = step.key === progress.step;
-                    const isDone = idx < activeStepIndex;
-                    const isPending = idx > activeStepIndex;
+                  {STEPS.map((step) => {
+                    const state = stepStates[step.key];
+                    const status = getStepStatus(step.key);
+                    const isActive = status === 'active';
+                    const isDone = status === 'done';
+                    const pct = state?.progress ?? null;
 
                     return (
                       <div key={step.key}>
@@ -343,26 +370,30 @@ export default function YouTubeDubber() {
                           <span className={`text-sm flex-1 ${
                             isDone ? 'text-green-300' : isActive ? 'text-white font-medium' : 'text-gray-500'
                           }`}>
-                            {isActive ? progress.label : isDone ? step.label : step.label}
+                            {state ? state.label : step.label}
                           </span>
 
                           {/* Detail text */}
-                          {isActive && progress.detail && (
-                            <span className="text-xs text-purple-300">{progress.detail}</span>
+                          {isActive && state?.detail && (
+                            <span className="text-xs text-purple-300">{state.detail}</span>
                           )}
 
                           {/* Percentage */}
-                          {isActive && progress.progress !== null && (
-                            <span className="text-xs text-purple-300 w-10 text-right">{progress.progress}%</span>
+                          {pct !== null && (
+                            <span className={`text-xs w-10 text-right ${isDone ? 'text-green-300' : 'text-purple-300'}`}>
+                              {pct}%
+                            </span>
                           )}
                         </div>
 
                         {/* Progress bar */}
-                        {isActive && progress.progress !== null && (
+                        {pct !== null && (
                           <div className="ml-9 h-2 bg-white/10 rounded-full overflow-hidden">
                             <div
-                              className="h-full bg-gradient-to-r from-purple-500 to-pink-500 rounded-full transition-all duration-500 ease-out"
-                              style={{ width: `${progress.progress}%` }}
+                              className={`h-full rounded-full transition-all duration-500 ease-out ${
+                                isDone ? 'bg-gradient-to-r from-green-500 to-emerald-500' : 'bg-gradient-to-r from-purple-500 to-pink-500'
+                              }`}
+                              style={{ width: `${pct}%` }}
                             />
                           </div>
                         )}
@@ -434,7 +465,7 @@ export default function YouTubeDubber() {
                   <video
                     controls
                     className="w-full h-auto max-h-96"
-                    src={`http://localhost:3001${result.downloadUrl}`}
+                    src={`${getBackendUrl()}${result.downloadUrl}`}
                   >
                     Your browser does not support the video tag.
                   </video>
@@ -444,13 +475,28 @@ export default function YouTubeDubber() {
               {/* Action Buttons */}
               <div className="flex flex-col sm:flex-row gap-4">
                 <a
-                  href={`http://localhost:3001${result.downloadUrl}`}
+                  href={`${getBackendUrl()}${result.downloadUrl}`}
                   download
                   className="flex-1 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white font-semibold py-3 px-6 rounded-2xl transition-all duration-300 transform hover:scale-105 shadow-xl text-center flex items-center justify-center gap-2"
                 >
                   <Download className="w-5 h-5" />
                   Download Video
                 </a>
+                <button
+                  onClick={() => {
+                    startDubJob({
+                      videoUrl,
+                      targetLanguage,
+                      burnCaptions: true,
+                      captionPosition: 'bottom',
+                      remerge: true
+                    });
+                  }}
+                  className="flex-1 bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white font-semibold py-3 px-6 rounded-2xl transition-all duration-300 transform hover:scale-105 shadow-xl flex items-center justify-center gap-2"
+                >
+                  <Subtitles className="w-5 h-5" />
+                  Add Captions
+                </button>
                 <button
                   onClick={resetForm}
                   className="flex-1 bg-white/10 hover:bg-white/20 text-white font-semibold py-3 px-6 rounded-2xl transition-all duration-300 border border-white/20 flex items-center justify-center gap-2"
