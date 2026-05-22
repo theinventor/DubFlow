@@ -38,13 +38,120 @@ if (OPENAI_API_KEY) {
 }
 
 // Ensure downloads directory exists
+const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 const ensureDownloadsDir = async () => {
-    const downloadsDir = path.join(__dirname, 'downloads');
     try {
-        await fs.access(downloadsDir);
+        await fs.access(DOWNLOADS_DIR);
     } catch {
-        await fs.mkdir(downloadsDir, { recursive: true });
+        await fs.mkdir(DOWNLOADS_DIR, { recursive: true });
     }
+};
+
+// Disk space management — evict oldest cache entries when space is low
+const getAvailableBytes = async () => {
+    try {
+        const { stdout } = await execAsync(`df --output=avail -B1 "${DOWNLOADS_DIR}" | tail -1`);
+        return parseInt(stdout.trim()) || 0;
+    } catch { return 0; }
+};
+
+const getExpectedDownloadSize = async (videoId) => {
+    // Ask yt-dlp for the filesize without downloading
+    try {
+        const { stdout } = await execAsync(
+            `yt-dlp -f "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]" --print filesize_approx "https://www.youtube.com/watch?v=${videoId}"`,
+            { timeout: 30000 }
+        );
+        const size = parseInt(stdout.trim()) || 0;
+        if (size > 0) return size;
+    } catch {}
+    // Fallback: assume 500MB (generous for a 1080p video)
+    return 500 * 1024 * 1024;
+};
+
+const getDirSize = async (dirPath) => {
+    try {
+        const { stdout } = await execAsync(`du -sb "${dirPath}" | cut -f1`);
+        return parseInt(stdout.trim()) || 0;
+    } catch { return 0; }
+};
+
+const getDirMtime = async (dirPath) => {
+    try {
+        const files = await fs.readdir(dirPath);
+        let latest = 0;
+        for (const f of files) {
+            const stat = await fs.stat(path.join(dirPath, f));
+            if (stat.mtimeMs > latest) latest = stat.mtimeMs;
+        }
+        return latest;
+    } catch { return 0; }
+};
+
+// Ensure enough disk space for a download. Evicts oldest cache + job dirs first.
+// Requires: neededBytes * 1.15 available (15% buffer)
+const ensureDiskSpace = async (neededBytes) => {
+    const requiredBytes = Math.ceil(neededBytes * 1.15);
+    let available = await getAvailableBytes();
+
+    if (available >= requiredBytes) {
+        console.log(`💾 Disk OK: ${(available / 1e9).toFixed(1)}GB available, need ${(requiredBytes / 1e9).toFixed(1)}GB`);
+        return;
+    }
+
+    console.log(`💾 Disk low: ${(available / 1e9).toFixed(1)}GB available, need ${(requiredBytes / 1e9).toFixed(1)}GB — evicting old files`);
+
+    // Collect all evictable directories: cache dirs + job dirs (UUIDs)
+    const entries = [];
+
+    // Cache dirs
+    const cacheBase = path.join(DOWNLOADS_DIR, 'cache');
+    try {
+        const cacheDirs = await fs.readdir(cacheBase);
+        for (const dir of cacheDirs) {
+            const fullPath = path.join(cacheBase, dir);
+            const stat = await fs.stat(fullPath);
+            if (stat.isDirectory()) {
+                entries.push({ path: fullPath, mtime: await getDirMtime(fullPath), size: await getDirSize(fullPath) });
+            }
+        }
+    } catch {}
+
+    // Job dirs (UUID directories directly under downloads/)
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    try {
+        const topDirs = await fs.readdir(DOWNLOADS_DIR);
+        for (const dir of topDirs) {
+            if (dir === 'cache') continue;
+            if (!uuidRegex.test(dir)) continue;
+            const fullPath = path.join(DOWNLOADS_DIR, dir);
+            const stat = await fs.stat(fullPath);
+            if (stat.isDirectory()) {
+                entries.push({ path: fullPath, mtime: await getDirMtime(fullPath), size: await getDirSize(fullPath) });
+            }
+        }
+    } catch {}
+
+    // Sort oldest first
+    entries.sort((a, b) => a.mtime - b.mtime);
+
+    for (const entry of entries) {
+        if (available >= requiredBytes) break;
+        console.log(`🗑️  Evicting ${entry.path} (${(entry.size / 1e6).toFixed(1)}MB, last used ${new Date(entry.mtime).toISOString()})`);
+        try {
+            await fs.rm(entry.path, { recursive: true, force: true });
+            available += entry.size;
+        } catch (err) {
+            console.error(`Failed to evict ${entry.path}: ${err.message}`);
+        }
+    }
+
+    if (available < requiredBytes) {
+        console.error(`💾 Still not enough space after eviction: ${(available / 1e9).toFixed(1)}GB available, need ${(requiredBytes / 1e9).toFixed(1)}GB`);
+        throw new Error(`Not enough disk space. Available: ${(available / 1e9).toFixed(1)}GB, needed: ${(requiredBytes / 1e9).toFixed(1)}GB. Clear space manually.`);
+    }
+
+    console.log(`💾 Eviction complete: ${(available / 1e9).toFixed(1)}GB now available`);
 };
 
 // Extract YouTube video ID from URL
@@ -179,7 +286,7 @@ const createSilence = async (duration, outputPath) => {
     const safeDuration = Math.max(0.1, Math.min(duration, 3600));
     try {
         await execAsync(
-            `ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=22050 -t ${safeDuration} -c:a pcm_s16le "${outputPath}"`,
+            `ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=24000 -t ${safeDuration} -c:a pcm_s16le "${outputPath}"`,
             { timeout: 10000 }
         );
         console.log(`Created silence: ${safeDuration}s -> ${outputPath}`);
@@ -215,9 +322,10 @@ const concatenateAudio = async (audioFiles, outputPath) => {
             command.input(file);
         });
         
-        // Create filter complex for concatenation
-        const filterComplex = audioFiles.map((_, index) => `[${index}:0]`).join('') + 
-                             `concat=n=${audioFiles.length}:v=0:a=1[out]`;
+        // Normalize all inputs to same sample rate before concatenating
+        const resample = audioFiles.map((_, index) => `[${index}:0]aresample=24000[a${index}]`).join(';');
+        const concatInputs = audioFiles.map((_, index) => `[a${index}]`).join('');
+        const filterComplex = `${resample};${concatInputs}concat=n=${audioFiles.length}:v=0:a=1[out]`;
         
         command
             .complexFilter(filterComplex)
@@ -586,9 +694,14 @@ app.post('/api/dub-video', async (req, res) => {
         const tempDir = path.join(__dirname, 'downloads', jobId);
         await fs.mkdir(tempDir, { recursive: true });
 
+        // Check disk space before downloading
+        sendProgress('download', 'Checking disk space...', 0);
+        const estimatedSize = await getExpectedDownloadSize(videoId);
+        await ensureDiskSpace(estimatedSize);
+
         // Start video download immediately (runs in background)
         const videoPath = path.join(tempDir, 'video.mp4');
-        sendProgress('download', 'Downloading video...', 0);
+        sendProgress('download', 'Downloading video...', 10);
         const videoDownloadPromise = (async () => {
             try {
                 await downloadVideoOnly(videoId, videoPath);
@@ -624,6 +737,14 @@ app.post('/api/dub-video', async (req, res) => {
 
             sendProgress('audio', 'Generating audio...', 0, `0/${totalSegments}`);
 
+            // Get actual duration of an audio file
+            const probeFileDuration = async (filePath) => {
+                try {
+                    const { stdout } = await execAsync(`ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`);
+                    return parseFloat(stdout.trim()) || 0;
+                } catch { return 0; }
+            };
+
             const generateOne = async (i) => {
                 const item = translatedTranscript[i];
                 if (!item.translatedText || item.translatedText.trim().length < 2) return null;
@@ -631,15 +752,16 @@ app.post('/api/dub-video', async (req, res) => {
                 const audioPath = path.join(tempDir, `line_${i}.mp3`);
                 try {
                     await generateAudio(item.translatedText, targetLanguage, audioPath);
+                    const actualDuration = await probeFileDuration(audioPath);
                     successfulClips++;
-                    return { path: audioPath, start: item.start, duration: item.duration, index: i };
+                    return { path: audioPath, start: item.start, duration: item.duration, actualDuration, index: i };
                 } catch (audioError) {
                     try {
                         const silenceDuration = Math.max(item.duration, 0.5);
                         const silencePath = path.join(tempDir, `silence_${i}.wav`);
                         await createSilence(silenceDuration, silencePath);
                         successfulClips++;
-                        return { path: silencePath, start: item.start, duration: silenceDuration, index: i };
+                        return { path: silencePath, start: item.start, duration: silenceDuration, actualDuration: silenceDuration, index: i };
                     } catch { return null; }
                 }
             };
@@ -662,26 +784,30 @@ app.post('/api/dub-video', async (req, res) => {
             sendProgress('audio', `Generated ${audioClips.length} audio clips`, 100);
 
             // Step 5: Align + concatenate audio
+            // Each clip has a target start time (clip.start) from the original transcript.
+            // We insert silence gaps so each clip begins at its original timestamp.
+            // We track actualCurrentTime = how many seconds of audio we've actually laid down.
             sendProgress('align', 'Aligning and concatenating audio...', 0);
             const alignedAudioFiles = [];
             audioClips.sort((a, b) => a.start - b.start);
-            let currentTime = 0;
+            let actualCurrentTime = 0;
             const totalClips = audioClips.length;
 
             for (let i = 0; i < totalClips; i++) {
                 const clip = audioClips[i];
-                if (clip.start > currentTime) {
-                    const silenceDuration = clip.start - currentTime;
+                if (clip.start > actualCurrentTime) {
+                    const silenceDuration = clip.start - actualCurrentTime;
                     if (silenceDuration > 0.1) {
                         const silencePath = path.join(tempDir, `gap_${i}_${Date.now()}.wav`);
                         try {
                             await createSilence(silenceDuration, silencePath);
                             alignedAudioFiles.push(silencePath);
+                            actualCurrentTime += silenceDuration;
                         } catch {}
                     }
                 }
                 alignedAudioFiles.push(clip.path);
-                currentTime = clip.start + clip.duration;
+                actualCurrentTime += clip.actualDuration || clip.duration;
 
                 if (i % 50 === 0 || i === totalClips - 1) {
                     const pct = Math.round(((i + 1) / totalClips) * 80);
